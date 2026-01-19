@@ -1,0 +1,4 @@
+*.env
+temp_audio/
+node_modules/
+behavior/__pycache__/
