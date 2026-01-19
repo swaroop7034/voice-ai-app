@@ -2,3 +2,5 @@
 temp_audio/
 node_modules/
 behavior/__pycache__/
+server-backend/.env
+server-backend/temp_audio/
