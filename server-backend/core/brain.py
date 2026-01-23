@@ -14,6 +14,7 @@ client = Groq(api_key=API_KEY)
 MODEL = "llama-3.1-8b-instant"   # works with 1.0.0
 
 def get_ai_response(user_text: str) -> str:
+    
     try:
         completion = client.chat.completions.create(
             model=MODEL,
@@ -28,4 +29,4 @@ def get_ai_response(user_text: str) -> str:
 
 # test mode only
 if __name__ == "__main__":
-    print(get_ai_response("What is artificial intelligence?"))
+    print(get_ai_response("St. Josephs college of enginering pala in one linecls"))
