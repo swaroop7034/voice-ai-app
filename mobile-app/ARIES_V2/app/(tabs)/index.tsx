@@ -47,57 +47,56 @@ export default function HomeScreen() {
   }, []);
 
   // --- RECORDING LOGIC ---
-  async function startRecording() {
-    try {
-      if (recording) {
-        await recording.stopAndUnloadAsync();
-        setRecording(null);
-      }
-
-      const { granted } = await Audio.requestPermissionsAsync();
-      if (!granted) return;
-
-      await Audio.setAudioModeAsync({
-        allowsRecordingIOS: true,
-        playsInSilentModeIOS: true,
-      });
-
-      const { recording: newRecording } = await Audio.Recording.createAsync(
-        Audio.RecordingOptionsPresets.HIGH_QUALITY,
-        (status) => {
-          if (status.metering !== undefined) {
-            setMetering((prev) => [...prev.slice(1), status.metering!]);
-          }
-        },
-        100,
-      );
-
-      setRecording(newRecording);
-      setStatus("LISTENING");
-      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
-    } catch (err) {
-      console.error("Failed to start recording", err);
-      setRecording(null);
+async function startRecording() {
+  try {
+    // 1. Ask for permission
+    const { granted } = await Audio.requestPermissionsAsync();
+    if (!granted) {
+      alert("Microphone permission is required!");
+      return;
     }
+
+    // 2. Configure for recording
+    await Audio.setAudioModeAsync({
+      allowsRecordingIOS: true,
+      playsInSilentModeIOS: true,
+    });
+
+    // 3. Create and Start the recording
+    const { recording } = await Audio.Recording.createAsync(
+      Audio.RecordingOptionsPresets.HIGH_QUALITY
+    );
+    
+    setRecording(recording);
+    setStatus("LISTENING");
+    console.log("Recording started...");
+  } catch (err) {
+    console.error("Failed to start recording", err);
   }
+}
 
   async function stopRecording() {
-    if (!recording) return;
-    try {
-      setStatus("THINKING");
-      await recording.stopAndUnloadAsync();
-      const uri = recording.getURI();
-      setRecording(null);
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      console.log("Recording ready at:", uri);
-      // Backend upload logic would go here
-      setTimeout(() => setStatus("IDLE"), 2000); // Simulate processing
-    } catch (error) {
-      console.error("Error stopping recording", error);
-      setRecording(null);
-      setStatus("IDLE");
-    }
+  if (!recording) return;
+
+  try {
+    setStatus("THINKING");
+    
+    // 4. Stop the recorder
+    await recording.stopAndUnloadAsync();
+    
+    // 5. Get the file's location (URI)
+    const uri = recording.getURI(); 
+    setRecording(null);
+
+    console.log("Recording saved at local path:", uri);
+    alert("Audio recorded! File is at: " + uri);
+
+    setStatus("IDLE");
+  } catch (error) {
+    console.error("Failed to stop recording", error);
+    setStatus("IDLE");
   }
+}
 
   // --- UI STYLES ---
   const ringStyle = (offset: number) =>
