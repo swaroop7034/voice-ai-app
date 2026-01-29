@@ -1,31 +1,26 @@
-import os
-from dotenv import load_dotenv
-from groq import Groq
+from datetime import datetime
+from core.sendtollm import send_to_llm
 
-# load .env for GROQ_API_KEY
-load_dotenv()
+def process_text(user_text: str) -> str:
+    """
+    Decides assistant response.
+    Fast command handling + LLM fallback.
+    """
 
-API_KEY = os.getenv("GROQ_API_KEY")
-if not API_KEY:
-    raise Exception("Missing GROQ_API_KEY in .env file")
+    text = user_text.lower().strip()
 
-client = Groq(api_key=API_KEY)
+    # Fast exits
+    if not text:
+        return "I didn't catch that."
 
-MODEL = "llama-3.1-8b-instant"   # works with 1.0.0
+    if "exit" in text or "quit" in text:
+        return "Goodbye. Have a nice day."
 
-def get_ai_response(user_text: str) -> str:
-    try:
-        completion = client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "user", "content": user_text}
-            ]
-        )
-        return completion.choices[0].message.content
-    except Exception as e:
-        return f"Error from AI: {e}"
+    if "time" in text:
+        return f"The time is {datetime.now().strftime('%I:%M %p')}"
 
+    if "how are you" in text:
+        return "I am doing well. How can I help you?"
 
-# test mode only
-if __name__ == "__main__":
-    print(get_ai_response("What is artificial intelligence?"))
+    # Fallback to LLM (mock or real)
+    return send_to_llm(text)
