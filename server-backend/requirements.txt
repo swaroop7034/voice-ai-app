@@ -5,3 +5,4 @@ google-generativeai
 openai-whisper
 elevenlabs
 python-dotenv
+gTTS

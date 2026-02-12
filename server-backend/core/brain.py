@@ -1,31 +1,22 @@
-import os
-from dotenv import load_dotenv
-from groq import Groq
+from datetime import datetime
+from core.llm_manager import get_aries_response
 
-# load .env for GROQ_API_KEY
-load_dotenv()
+def process_text(user_text: str) -> str:
+    """
+    Decides whether to use a local hardcoded command or 
+    the local Llama model.
+    """
+    text = user_text.lower().strip()
 
-API_KEY = os.getenv("GROQ_API_KEY")
-if not API_KEY:
-    raise Exception("Missing GROQ_API_KEY in .env file")
+    if not text:
+        return "I am standing by, sir."
 
-client = Groq(api_key=API_KEY)
+    # --- LOCAL FAST COMMANDS ---
+    if "time" in text:
+        return f"The current time is {datetime.now().strftime('%I:%M %p')}."
 
-MODEL = "llama-3.1-8b-instant"   # works with 1.0.0
+    if "how are you" in text:
+        return "All systems are nominal. My core temperature is stable."
 
-def get_ai_response(user_text: str) -> str:
-    try:
-        completion = client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "user", "content": user_text}
-            ]
-        )
-        return completion.choices[0].message.content
-    except Exception as e:
-        return f"Error from AI: {e}"
-
-
-# test mode only
-if __name__ == "__main__":
-    print(get_ai_response("What is artificial intelligence?"))
+    # --- LOCAL AI FALLBACK ---
+    return get_aries_response(user_text)

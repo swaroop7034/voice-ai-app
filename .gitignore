@@ -1,6 +1,7 @@
-*.env
-temp_audio/
 node_modules/
-behavior/__pycache__/
-server-backend/.env
-server-backend/temp_audio/
+.expo/
+temp_audio/
+__pycache__/
+.env
+*.m4a
+*.mp3
