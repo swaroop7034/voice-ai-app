@@ -5,3 +5,20 @@ __pycache__/
 .env
 *.m4a
 *.mp3
+# Python
+*.py[cod]
+venv/
+
+# Aries Temp Files
+temp_audio/incoming/*
+temp_audio/outgoing/*
+
+# Google API (Keep these private!)
+data/token.json
+data/credentials.json
+
+# OS files
+.DS_Store
+
+server-backend/data/token.json
+server-backend/data/credentials.json
