@@ -97,6 +97,26 @@ def get_today_events():
     return get_events_for_date(datetime.datetime.now(IST).date())
 
 
+def get_primary_calendar_user_id():
+    try:
+        service = get_calendar_service()
+        response = service.calendarList().list(maxResults=20).execute()
+        calendars = response.get('items', [])
+
+        for calendar in calendars:
+            if calendar.get('primary'):
+                return calendar.get('id') or calendar.get('summary')
+
+        if calendars:
+            first_calendar = calendars[0]
+            return first_calendar.get('id') or first_calendar.get('summary')
+
+    except Exception as e:
+        print(f"[CALENDAR USER ID] {e}")
+
+    return None
+
+
 # ─────────────────────────────────────────────
 #  SLOT FINDER  (single day)
 # ─────────────────────────────────────────────

@@ -1,6 +1,17 @@
+import asyncio
 import re
 from datetime import datetime, timedelta, timezone
-from core.llm_manager import get_aries_response
+from core.llm_manager import get_aries_response, get_recent_chat_history
+from core.memory_classifier import classify_and_store_background
+from core.user_profile import get_user_profile, update_user_profile, format_profile_section
+from core.intelligence_layer import (
+    MAX_HISTORY,
+    MAX_MEMORY,
+    apply_memory_decay,
+    filter_memories_by_type,
+    smart_memory_selector,
+    compress_context,
+)
 from tools.search_module import fetch_live_info
 from tools.calendar_module import (
     get_upcoming_events,
@@ -12,6 +23,7 @@ from tools.calendar_module import (
     confirm_reschedule,
 )
 import core.state as state
+from integrations.supabase_store import build_memory_context, get_default_user_id, log_interaction, search_similar
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -27,6 +39,7 @@ PENDING_RESCHEDULE = {}
 #  STT CLEANUP
 # ─────────────────────────────────────────────
 TIME_REGEX = r'(\d{1,2})(?:[:\.](\d{2}))?\s*([ap]\.?m?\.?)'
+TIME_QUERY_REGEX = r'\b(what\s+(?:is|s\s+)?(?:the\s+)?time|current\s+time|tell\s+me\s+the\s+time|what\'s\s+the\s+time)\b'
 
 # Word → digit map for spoken numbers STT often returns
 _WORD_TO_NUM = {
@@ -105,11 +118,14 @@ def _reset_state():
 # ─────────────────────────────────────────────
 #  MAIN ENTRY POINT
 # ─────────────────────────────────────────────
-def process_text(user_text: str) -> str:
+async def process_text(user_text: str, user_id: str | None = None) -> str:
     global PENDING_DATA, PENDING_RESCHEDULE
 
+    resolved_user_id = user_id or get_default_user_id()
     user_text = clean_stt_shorthand(user_text)
     text = user_text.lower().strip()
+
+    print(f"[QUERY] user_id={resolved_user_id} text={user_text}")
 
     if not text:
         return "I am standing by, Sir."
@@ -368,7 +384,7 @@ def process_text(user_text: str) -> str:
     # ══════════════════════════════════════════
     #  STEP 7 — QUICK RESPONSES
     # ══════════════════════════════════════════
-    if re.search(r'\btime\b', text):
+    if re.search(TIME_QUERY_REGEX, text):
         return f"The current time is {datetime.now(IST).strftime('%I:%M %p')}."
 
     if "how are you" in text:
@@ -381,14 +397,59 @@ def process_text(user_text: str) -> str:
     if state.last_intent != "CONFIRMING_ALERT":
         state.last_intent = None
 
-    response = get_aries_response(user_text)
+    memory_task = asyncio.create_task(search_similar(user_text, resolved_user_id, limit=8))
+    history_task = asyncio.create_task(get_recent_chat_history(resolved_user_id, limit=MAX_HISTORY))
+    profile_task = asyncio.create_task(get_user_profile(resolved_user_id))
+    retrieved_memories, recent_history, profile = await asyncio.gather(memory_task, history_task, profile_task)
+
+    decayed_memories = apply_memory_decay(retrieved_memories)
+    memory_candidates, preference_memories = filter_memories_by_type(decayed_memories)
+    selected_memories = smart_memory_selector(memory_candidates, max_memory=MAX_MEMORY)
+    compressed_points = compress_context(selected_memories, recent_history)
+
+    if preference_memories:
+        pref_points = []
+        for pref in preference_memories[:2]:
+            pref_text = (pref.get("user_text") or "").strip()
+            if pref_text:
+                pref_points.append(f"* {pref_text[:120]}")
+        preference_context = "\n".join(pref_points)
+    else:
+        preference_context = ""
+
+    memory_context = "\n".join(f"* {point}" for point in compressed_points)
+    profile_context = format_profile_section(profile)
+    if preference_context:
+        profile_context = f"{profile_context}\n\n## Preference memories:\n{preference_context}".strip()
+
+    print(
+        f"[INTELLIGENCE] memories_retrieved={len(retrieved_memories)} "
+        f"memories_used={len(selected_memories)} history_used={len(recent_history[-MAX_HISTORY:])}"
+    )
+    print(f"[INTELLIGENCE] compressed_context={compressed_points}")
+
+    response = await get_aries_response(
+        user_text,
+        resolved_user_id,
+        memory_context=memory_context,
+        profile_context=profile_context,
+        recent_history=recent_history[-MAX_HISTORY:],
+    )
 
     if response.strip().upper().startswith("SEARCH"):
         try:
             query    = response.split("SEARCH", 1)[-1].strip(" []:")
             web_data = fetch_live_info(query)
-            refined  = f"Found info: {web_data}\nUser asked: {user_text}\nAnswer wittily."
-            return get_aries_response(refined)
+            refined  = (
+                f"Found info: {web_data}\n"
+                f"User asked: {user_text}\n"
+                "Answer factually first, then add a short witty remark if appropriate."
+            )
+            return await get_aries_response(
+                refined,
+                resolved_user_id,
+                memory_context=memory_context,
+            )
         except Exception:
             return "Web search failed. Relying on local core."
 

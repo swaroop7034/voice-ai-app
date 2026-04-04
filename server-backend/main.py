@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Request
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import uvicorn
@@ -12,6 +12,9 @@ from core.stt_engine import speech_to_text
 from core.brain import process_text, handle_alert_event
 from core.tts_engine import text_to_speech
 from core.proactive_agent import monitor_schedule
+from core.memory_classifier import classify_and_store_background
+from core.user_profile import update_user_profile
+from integrations.supabase_store import log_interaction, get_default_user_id
 
 app = FastAPI()
 
@@ -21,19 +24,50 @@ os.makedirs("temp_audio/incoming", exist_ok=True)
 os.makedirs("temp_audio/outgoing", exist_ok=True)
 
 
+def _resolve_user_id(user_id: str | None) -> str:
+    resolved = (user_id or "").strip()
+    return resolved if resolved else get_default_user_id()
+
+
+async def _trigger_background_personalization(user_id: str | None, user_text: str, aries_reply: str):
+    """
+    Trigger memory classification and profile update in background without waits.
+    """
+    try:
+        await classify_and_store_background(
+            user_id=user_id,
+            user_text=user_text,
+            aries_text=aries_reply,
+            store_callback=log_interaction,
+            update_profile_callback=update_user_profile,
+        )
+    except Exception as e:
+        print(f"[BACKGROUND PERSONALIZATION] Error: {e}")
+
+
 class TextInput(BaseModel):
     text: str
+    user_id: str | None = None
 
 
 # --- TEXT INPUT ENDPOINT (used by slot picker in frontend) ---
 @app.post("/text-input")
-async def handle_text_input(body: TextInput):
-    """Accepts raw text directly — no STT needed. Used for slot selection UI."""
+async def handle_text_input(background_tasks: BackgroundTasks, body: TextInput):
+    """Accepts raw text directly - no STT needed. Used for slot selection UI."""
     user_query = body.text.strip()
     if not user_query:
         return JSONResponse({"status": "error", "message": "Empty input"})
 
-    aries_reply = process_text(user_query)
+    resolved_user_id = _resolve_user_id(body.user_id)
+    print(f"[REQUEST] /text-input user_id={resolved_user_id} text={user_query}")
+
+    aries_reply = await process_text(user_query, resolved_user_id)
+    background_tasks.add_task(
+        _trigger_background_personalization,
+        resolved_user_id,
+        user_query,
+        aries_reply,
+    )
 
     output_path = "temp_audio/outgoing/response.mp3"
     text_to_speech(aries_reply, output_path)
@@ -54,10 +88,12 @@ async def handle_text_input(body: TextInput):
 
 # --- HEARTBEAT ENDPOINT ---
 @app.get("/check-alerts")
-async def check_alerts():
+async def check_alerts(background_tasks: BackgroundTasks):
+    print("[HEARTBEAT] /check-alerts polled")
     if alert_queue:
-        event_obj  = alert_queue.pop(0)
+        event_obj = alert_queue.pop(0)
         alert_text = handle_alert_event(event_obj)
+        background_tasks.add_task(log_interaction, "system", "", alert_text)
 
         output_path = "temp_audio/outgoing/alert_voice.mp3"
         text_to_speech(alert_text, output_path)
@@ -73,7 +109,11 @@ async def check_alerts():
 
 # --- STANDARD VOICE CHAT ---
 @app.post("/chat")
-async def handle_voice_chat(file: UploadFile = File(...)):
+async def handle_voice_chat(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    user_id: str | None = Form(default=None),
+):
     input_path = f"temp_audio/incoming/{file.filename}"
     with open(input_path, "wb") as f:
         f.write(await file.read())
@@ -82,7 +122,16 @@ async def handle_voice_chat(file: UploadFile = File(...)):
     if not user_query:
         return JSONResponse({"status": "error", "message": "No speech detected"})
 
-    aries_reply = process_text(user_query)
+    resolved_user_id = _resolve_user_id(user_id)
+    print(f"[REQUEST] /chat user_id={resolved_user_id} text={user_query}")
+
+    aries_reply = await process_text(user_query, resolved_user_id)
+    background_tasks.add_task(
+        _trigger_background_personalization,
+        resolved_user_id,
+        user_query,
+        aries_reply,
+    )
 
     output_path = "temp_audio/outgoing/response.mp3"
     text_to_speech(aries_reply, output_path)
