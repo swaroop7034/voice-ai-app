@@ -4,7 +4,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-from logger import log_debug, log_error
+from logger import log_debug, log_error, log_step
 
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
@@ -110,6 +110,142 @@ def get_events_for_date(target_date: datetime.date):
 
 def get_today_events():
     return get_events_for_date(datetime.datetime.now(IST).date())
+
+
+def _parse_event_bounds(event: dict) -> tuple[datetime.datetime | None, datetime.datetime | None]:
+    start_raw = event.get('start', {}).get('dateTime') or event.get('start', {}).get('date')
+    end_raw = event.get('end', {}).get('dateTime') or event.get('end', {}).get('date')
+    if not start_raw:
+        return None, None
+
+    try:
+        start_dt = datetime.datetime.fromisoformat(start_raw.replace('Z', '+00:00'))
+    except Exception:
+        return None, None
+
+    if start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=IST)
+    else:
+        start_dt = start_dt.astimezone(IST)
+
+    if end_raw:
+        try:
+            end_dt = datetime.datetime.fromisoformat(end_raw.replace('Z', '+00:00'))
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=IST)
+            else:
+                end_dt = end_dt.astimezone(IST)
+        except Exception:
+            end_dt = start_dt + datetime.timedelta(hours=1)
+    else:
+        end_dt = start_dt + datetime.timedelta(hours=1)
+
+    if end_dt <= start_dt:
+        end_dt = start_dt + datetime.timedelta(hours=1)
+
+    return start_dt, end_dt
+
+
+def check_conflict(start_time: datetime.datetime, end_time: datetime.datetime, events: list[dict]) -> bool:
+    for event in events:
+        event_start, event_end = _parse_event_bounds(event)
+        if event_start is None or event_end is None:
+            continue
+        if start_time < event_end and end_time > event_start:
+            return True
+    return False
+
+
+def filter_slots_by_duration(
+    free_slots: list[tuple[datetime.datetime, datetime.datetime]],
+    duration: datetime.timedelta,
+) -> list[tuple[datetime.datetime, datetime.datetime]]:
+    return [(slot_start, slot_end) for slot_start, slot_end in free_slots if (slot_end - slot_start) >= duration]
+
+
+def find_free_slots(
+    events: list[dict],
+    day_start: datetime.datetime,
+    day_end: datetime.datetime,
+    duration: datetime.timedelta,
+) -> list[tuple[datetime.datetime, datetime.datetime]]:
+    free_slots: list[tuple[datetime.datetime, datetime.datetime]] = []
+    current = day_start
+
+    intervals: list[tuple[datetime.datetime, datetime.datetime]] = []
+    for event in events:
+        event_start, event_end = _parse_event_bounds(event)
+        if event_start is None or event_end is None:
+            continue
+        if event_end <= day_start or event_start >= day_end:
+            continue
+        clipped_start = max(event_start, day_start)
+        clipped_end = min(event_end, day_end)
+        if clipped_end > clipped_start:
+            intervals.append((clipped_start, clipped_end))
+
+    for event_start, event_end in sorted(intervals, key=lambda x: x[0]):
+        if current < event_start:
+            free_slots.append((current, event_start))
+        current = max(current, event_end)
+
+    if current < day_end:
+        free_slots.append((current, day_end))
+
+    return filter_slots_by_duration(free_slots, duration)
+
+
+def suggest_conflict_free_slots(
+    requested_start: datetime.datetime,
+    duration: datetime.timedelta,
+    count: int = 3,
+) -> list[tuple[datetime.datetime, datetime.datetime, str]]:
+    suggested: list[tuple[datetime.datetime, datetime.datetime, str]] = []
+    requested_start = requested_start.astimezone(IST)
+    today = datetime.datetime.now(IST).date()
+
+    for day_offset in range(MAX_SEARCH_DAYS * 2):
+        if len(suggested) >= count:
+            break
+
+        target_date = requested_start.date() + datetime.timedelta(days=day_offset)
+        day_start = datetime.datetime(
+            target_date.year,
+            target_date.month,
+            target_date.day,
+            WORK_START_HOUR,
+            0,
+            0,
+            tzinfo=IST,
+        )
+        day_end = datetime.datetime(
+            target_date.year,
+            target_date.month,
+            target_date.day,
+            WORK_END_HOUR,
+            0,
+            0,
+            tzinfo=IST,
+        )
+
+        window_start = max(day_start, requested_start) if day_offset == 0 else day_start
+        if window_start >= day_end:
+            continue
+
+        events = get_events_for_date(target_date)
+        free_ranges = find_free_slots(events, window_start, day_end, duration)
+        day_label = _day_label(target_date, today)
+
+        for free_start, free_end in free_ranges:
+            if len(suggested) >= count:
+                break
+            slot_start = free_start
+            while slot_start + duration <= free_end and len(suggested) < count:
+                slot_end = slot_start + duration
+                suggested.append((slot_start, slot_end, day_label))
+                slot_start = slot_start + duration
+
+    return suggested
 
 
 def get_primary_calendar_user_id():
@@ -458,6 +594,34 @@ def create_event(summary, start_iso, end_iso):
         return True
     except Exception as e:
         log_error(f"Calendar create error: {e}")
+        return False
+
+
+def rename_event_title(event: dict, new_summary: str) -> bool:
+    """Rename a Google Calendar event summary/title."""
+    try:
+        service = get_calendar_service()
+        event['summary'] = new_summary
+        updated_event = service.events().update(
+            calendarId='primary',
+            eventId=event['id'],
+            body=event,
+        ).execute()
+
+        try:
+            from integrations.supabase_store import get_default_user_id, upsert_calendar_event_sync
+
+            upsert_calendar_event_sync(
+                user_id=get_default_user_id(),
+                event=updated_event,
+                source="aris_renamed",
+            )
+        except Exception as sync_exc:
+            log_error(f"CALENDAR sync aris_renamed->supabase failed: {sync_exc}")
+
+        return True
+    except Exception as e:
+        log_error(f"Calendar rename error: {e}")
         return False
 
 

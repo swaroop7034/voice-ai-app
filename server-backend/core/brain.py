@@ -16,10 +16,13 @@ from core.intelligence_layer import (
 )
 from tools.search_module import fetch_live_info
 from tools.calendar_module import (
+    check_conflict,
     get_upcoming_events,
     get_today_events,
     reschedule_next_event,
     create_event,
+    rename_event_title,
+    suggest_conflict_free_slots,
     suggest_reschedule_slot,
     suggest_reschedule_slots,
     confirm_reschedule,
@@ -29,6 +32,7 @@ from integrations.supabase_store import build_memory_context, get_default_user_i
 from logger import logger, log_error, log_step
 
 IST = timezone(timedelta(hours=5, minutes=30))
+FLOW_TIMEOUT_SECONDS = 120
 
 # ─────────────────────────────────────────────
 #  STATE — all reads/writes go through core.state
@@ -37,6 +41,8 @@ IST = timezone(timedelta(hours=5, minutes=30))
 # Local-only state (not needed outside brain)
 PENDING_DATA      = {}
 PENDING_RESCHEDULE = {}
+PENDING_CONFLICT = {}
+USER_FLOW_STATE: dict[str, dict[str, object]] = {}
 
 # ─────────────────────────────────────────────
 #  STT CLEANUP
@@ -99,11 +105,18 @@ RESCHEDULE_TRIGGERS = [
 
 CONFIRM_WORDS  = ["yes", "fine", "ok", "sure", "yep", "confirm", "do it", "go ahead", "sounds good"]
 DECLINE_WORDS  = ["no", "don't", "cancel", "stop", "never mind", "skip"]
+SCHEDULING_FOLLOWUP_KEYWORDS = [
+    "reschedule", "change", "move", "make it", "instead", "cancel", "yes", "confirm",
+]
+RENAME_FOLLOWUP_KEYWORDS = [
+    "rename", "retitle", "change", "call it", "name it", "today", "tomorrow", "instead",
+]
 
 SCHEDULE_KEYWORDS = ["schedule", "add", "set", "book", "create", "plan", "meeting", "appointment"]
 RESCHEDULE_KEYWORDS = [
     "reschedule", "move", "shift", "change", "postpone", "another slot", "different time", "can't make",
 ]
+RENAME_KEYWORDS = ["rename", "retitle", "change title", "change name", "call it", "name it"]
 CANCEL_KEYWORDS = ["cancel", "drop", "remove", "delete", "call off"]
 QUERY_EVENT_KEYWORDS = ["agenda", "events", "meeting", "schedule", "plans"]
 QUERY_VERBS = ["what", "show", "list", "check", "tell"]
@@ -127,6 +140,7 @@ def classify_intent(text: str) -> str:
     if _is_reschedule_intent(txt):
         reschedule_hits += 2
 
+    rename_hits = sum(1 for keyword in RENAME_KEYWORDS if keyword in txt)
     cancel_hits = sum(1 for keyword in CANCEL_KEYWORDS if keyword in txt)
     schedule_hits = sum(1 for keyword in SCHEDULE_KEYWORDS if keyword in txt)
     query_hits = sum(1 for keyword in QUERY_EVENT_KEYWORDS if keyword in txt)
@@ -135,6 +149,10 @@ def classify_intent(text: str) -> str:
 
     if reschedule_hits >= 2:
         return "reschedule"
+    if rename_hits >= 1 and schedule_hits >= 1:
+        return "rename"
+    if rename_hits >= 1:
+        return "rename"
     if cancel_hits >= 2 and reschedule_hits == 0:
         return "cancel"
     if query_hits >= 1 and query_verb_hits >= 1 and not has_time:
@@ -155,7 +173,7 @@ def classify_intent(text: str) -> str:
 
 async def classify_intent_with_llm(text: str) -> str:
     prompt = (
-        "Classify this request into one of [schedule, reschedule, cancel, general]. "
+        "Classify this request into one of [schedule, reschedule, rename, cancel, general]. "
         "Return only one word.\n"
         f"Request: {text}"
     )
@@ -168,7 +186,7 @@ async def classify_intent_with_llm(text: str) -> str:
         )
         label = str(response.get("response", "general")).strip().lower()
         label = re.sub(r"[^a-z_]", "", label)
-        if label in {"schedule", "reschedule", "cancel", "general"}:
+        if label in {"schedule", "reschedule", "rename", "cancel", "general"}:
             return label
         return "general"
     except Exception as exc:
@@ -177,11 +195,76 @@ async def classify_intent_with_llm(text: str) -> str:
 
 
 def _reset_state():
-    global PENDING_DATA, PENDING_RESCHEDULE
+    global PENDING_DATA, PENDING_RESCHEDULE, PENDING_CONFLICT
     state.last_intent         = None
     state.current_alert_event = None
     PENDING_DATA              = {}
     PENDING_RESCHEDULE        = {}
+    PENDING_CONFLICT          = {}
+
+
+def _get_user_flow_state(user_id: str) -> dict[str, object]:
+    return USER_FLOW_STATE.setdefault(
+        user_id,
+        {
+            "active_flow": None,
+            "flow_data": {},
+            "last_updated": datetime.now(IST),
+        },
+    )
+
+
+def _start_scheduling_flow(user_id: str, flow_data: dict[str, object] | None = None) -> None:
+    flow_state = _get_user_flow_state(user_id)
+    if flow_state.get("active_flow") != "scheduling":
+        log_step("FLOW_STARTED_SCHEDULING")
+    flow_state["active_flow"] = "scheduling"
+    if flow_data is not None:
+        flow_state["flow_data"] = flow_data
+    flow_state["last_updated"] = datetime.now(IST)
+
+
+def _start_rename_flow(user_id: str, flow_data: dict[str, object] | None = None) -> None:
+    flow_state = _get_user_flow_state(user_id)
+    if flow_state.get("active_flow") != "rename":
+        log_step("FLOW_STARTED_RENAME")
+    flow_state["active_flow"] = "rename"
+    if flow_data is not None:
+        flow_state["flow_data"] = flow_data
+    flow_state["last_updated"] = datetime.now(IST)
+
+
+def _update_scheduling_flow_data(user_id: str, updates: dict[str, object]) -> None:
+    flow_state = _get_user_flow_state(user_id)
+    existing = dict(flow_state.get("flow_data") or {})
+    existing.update(updates)
+    flow_state["flow_data"] = existing
+    flow_state["last_updated"] = datetime.now(IST)
+
+
+def _end_scheduling_flow(user_id: str) -> None:
+    flow_state = _get_user_flow_state(user_id)
+    if flow_state.get("active_flow") is not None:
+        log_step("FLOW_ENDED")
+    flow_state["active_flow"] = None
+    flow_state["flow_data"] = {}
+    flow_state["last_updated"] = datetime.now(IST)
+
+
+def _is_scheduling_followup_text(text: str) -> bool:
+    if _extract_time_tokens(text):
+        return True
+    return any(keyword in text for keyword in SCHEDULING_FOLLOWUP_KEYWORDS)
+
+
+def _is_rename_followup_text(text: str) -> bool:
+    if _extract_time_tokens(text):
+        return True
+    return any(keyword in text for keyword in RENAME_FOLLOWUP_KEYWORDS)
+
+
+def _is_explicit_cancel_request(text: str) -> bool:
+    return bool(re.search(r"\b(cancel|stop|skip|dont|don't)\b|never\s+mind", text, flags=re.IGNORECASE))
 
 
 def _extract_time_tokens(text: str) -> list[tuple[str, str, str]]:
@@ -202,11 +285,33 @@ def _extract_time_tokens(text: str) -> list[tuple[str, str, str]]:
     return tokens
 
 
+def _convert_time_token(token: tuple[str, str, str], require_meridiem: bool = True) -> tuple[int, int]:
+    hour = int(token[0])
+    minute = int(token[1]) if token[1] else 0
+    meridiem = token[2].replace('.', '').lower() if token[2] else ""
+
+    if not meridiem:
+        if require_meridiem and hour <= 12:
+            raise ValueError("Ambiguous time without AM/PM")
+        return hour, minute
+
+    if 'p' in meridiem and hour < 12:
+        hour += 12
+    if 'a' in meridiem and hour == 12:
+        hour = 0
+    return hour, minute
+
+
+def _format_slot_options(slots: list[tuple[datetime, datetime, str]]) -> str:
+    lines = [f"{i + 1}. {label} at {start.strftime('%I:%M %p')}" for i, (start, _end, label) in enumerate(slots)]
+    return "\n".join(lines)
+
+
 # ─────────────────────────────────────────────
 #  MAIN ENTRY POINT
 # ─────────────────────────────────────────────
 async def process_text(user_text: str, user_id: str | None = None) -> str:
-    global PENDING_DATA, PENDING_RESCHEDULE
+    global PENDING_DATA, PENDING_RESCHEDULE, PENDING_CONFLICT
 
     resolved_user_id = user_id or get_default_user_id()
     user_text = clean_stt_shorthand(user_text)
@@ -216,6 +321,168 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
         return "I am standing by, Sir."
 
     now = datetime.now(IST)
+    forced_intent: str | None = None
+    scheduling_timed_out = False
+
+    flow_state = _get_user_flow_state(resolved_user_id)
+    active_flow = flow_state.get("active_flow")
+    last_updated = flow_state.get("last_updated")
+    if isinstance(last_updated, datetime) and (now - last_updated).total_seconds() > FLOW_TIMEOUT_SECONDS:
+        if active_flow in {"scheduling", "rename"}:
+            log_step("FLOW_TIMEOUT")
+            _reset_state()
+            _end_scheduling_flow(resolved_user_id)
+            active_flow = None
+            scheduling_timed_out = True
+
+    if scheduling_timed_out and _is_scheduling_followup_text(text) and not any(k in text for k in SCHEDULE_KEYWORDS):
+        return (
+            "Your scheduling session timed out, Sir. "
+            "Please start again with the full request, for example: schedule a meeting at 4 PM."
+        )
+
+    if scheduling_timed_out and _is_rename_followup_text(text) and "rename" not in text and "retitle" not in text:
+        return (
+            "Your rename session timed out, Sir. "
+            "Please restate the request, for example: rename my 10 AM meeting to Project Review."
+        )
+
+    if active_flow == "scheduling":
+        flow_state["last_updated"] = now
+
+        if _is_explicit_cancel_request(text):
+            _reset_state()
+            _end_scheduling_flow(resolved_user_id)
+            return "Scheduling cancelled, Sir."
+
+        # During scheduling flow, treat follow-ups as scheduling input even if classifier is uncertain.
+        if _is_scheduling_followup_text(text):
+            log_step("SCHEDULING_FOLLOWUP_HANDLED")
+            flow_data = dict(flow_state.get("flow_data") or {})
+            flow_title = str(flow_data.get("title") or PENDING_DATA.get("title") or "Meeting")
+            flow_day = str(flow_data.get("day") or PENDING_DATA.get("day") or "today")
+
+            if state.last_intent not in {"AWAITING_RESCHEDULE_CONFIRM", "AWAITING_CONFLICT_RESOLUTION"}:
+                if _extract_time_tokens(text) and "schedule" not in text:
+                    text = f"schedule {flow_title} {text}"
+                elif any(token in text for token in ["make it", "change", "move", "instead", "reschedule"]):
+                    text = f"schedule {flow_title} {text}"
+
+                if "tomorrow" in text:
+                    flow_day = "tomorrow"
+                elif "today" in text:
+                    flow_day = "today"
+                _update_scheduling_flow_data(resolved_user_id, {"title": flow_title, "day": flow_day})
+                forced_intent = "schedule"
+
+    if active_flow == "rename":
+        flow_state["last_updated"] = now
+
+        if _is_explicit_cancel_request(text):
+            _end_scheduling_flow(resolved_user_id)
+            return "Rename cancelled, Sir."
+
+        if _is_rename_followup_text(text):
+            log_step("RENAME_FOLLOWUP_HANDLED")
+            flow_data = dict(flow_state.get("flow_data") or {})
+            flow_new_title = str(flow_data.get("new_title") or "").strip()
+            flow_old_hint = str(flow_data.get("old_title_hint") or "").strip()
+
+            if "to " not in text and " as " not in text and flow_new_title:
+                base = text
+                if _extract_time_tokens(base):
+                    time_text = _extract_time_tokens(base)[0]
+                    inferred_time = f"{time_text[0]}:{(time_text[1] or '00')} {time_text[2]}".strip()
+                    text = f"rename {flow_old_hint or 'meeting'} {inferred_time} to {flow_new_title}"
+                else:
+                    text = f"rename {flow_old_hint or 'meeting'} {base} to {flow_new_title}"
+
+            forced_intent = "rename"
+        else:
+            return "I am still in rename mode, Sir. Tell me the corrected day/time or the new title."
+
+    # ══════════════════════════════════════════
+    #  STEP 0 — CONFLICT-RESOLUTION FOLLOW-UP
+    # ══════════════════════════════════════════
+    if state.last_intent == "AWAITING_CONFLICT_RESOLUTION" and PENDING_CONFLICT:
+        slots = PENDING_CONFLICT.get("slots", [])
+        title = str(PENDING_CONFLICT.get("title") or "Meeting")
+        duration_minutes = int(PENDING_CONFLICT.get("duration_minutes") or 60)
+        duration = timedelta(minutes=duration_minutes)
+
+        if any(w in text for w in DECLINE_WORDS):
+            _reset_state()
+            _end_scheduling_flow(resolved_user_id)
+            return "Understood, Sir. I will not schedule that event."
+
+        selected_slot = None
+        num_match = re.search(r'\b([1-5]|one|two|three|four|five|first|second|third|fourth|fifth)\b', text)
+        word_to_idx = {
+            'one': 0, 'first': 0, 'two': 1, 'second': 1,
+            'three': 2, 'third': 2, 'four': 3, 'fourth': 3,
+            'five': 4, 'fifth': 4,
+        }
+        if num_match and slots:
+            raw = num_match.group(1)
+            slot_idx = int(raw) - 1 if raw.isdigit() else word_to_idx.get(raw.lower(), -1)
+            if 0 <= slot_idx < len(slots):
+                selected_slot = slots[slot_idx]
+
+        if selected_slot is None:
+            picked_times = _extract_time_tokens(text)
+            if picked_times:
+                try:
+                    hour, minute = _convert_time_token(picked_times[0], require_meridiem=False)
+                    for start_dt, end_dt, label in slots:
+                        if start_dt.hour == hour and start_dt.minute == minute:
+                            selected_slot = (start_dt, end_dt, label)
+                            break
+                except Exception:
+                    selected_slot = None
+
+        if selected_slot is None:
+            if slots:
+                return (
+                    "Please choose one of these available slots, Sir:\n"
+                    f"{_format_slot_options(slots)}"
+                )
+            _reset_state()
+            return "I could not find available slots anymore, Sir. Please ask me to schedule again."
+
+        chosen_start, chosen_end, chosen_label = selected_slot
+        selected_window_events = get_upcoming_events(
+            50,
+            timeMin=chosen_start.astimezone(timezone.utc).isoformat(),
+            timeMax=chosen_end.astimezone(timezone.utc).isoformat(),
+        )
+        log_step("CALENDAR_EVENTS_FETCHED")
+
+        still_conflict = check_conflict(chosen_start, chosen_end, selected_window_events)
+        log_step("CONFLICT_CHECK_COMPLETED")
+
+        if still_conflict:
+            log_step("TIME_CONFLICT_DETECTED")
+            refreshed_slots = suggest_conflict_free_slots(chosen_start + timedelta(minutes=15), duration, count=3)
+            log_step("FREE_SLOTS_GENERATED")
+            if refreshed_slots:
+                PENDING_CONFLICT["slots"] = refreshed_slots
+                return (
+                    f"Sir, that time is no longer available for '{title}'. Here are updated slots:\n\n"
+                    f"{_format_slot_options(refreshed_slots)}\n"
+                    "Would you like me to schedule it at one of these times?"
+                )
+
+            _reset_state()
+            return "Sir, today appears fully booked. Please tell me a different time or day."
+
+        success = create_event(title, chosen_start.isoformat(), chosen_end.isoformat())
+        if success:
+            log_step("EVENT_CREATED")
+            _reset_state()
+            _end_scheduling_flow(resolved_user_id)
+            return f"Done, Sir. I've scheduled '{title}' for {chosen_label} at {chosen_start.strftime('%I:%M %p')}."
+
+        return "The calendar uplink failed while creating the event, Sir."
 
     # ══════════════════════════════════════════
     #  STEP 1 — USER PICKING A SLOT FROM THE LIST
@@ -312,6 +579,9 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
     if force_schedule_intent:
         intent = "schedule"
         intent_source = "context"
+    if forced_intent:
+        intent = forced_intent
+        intent_source = "flow"
     logger.debug(f"[INTENT] source={intent_source} final_intent={intent} text={text}")
 
     # ══════════════════════════════════════════
@@ -413,6 +683,7 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
     # ══════════════════════════════════════════
     if intent == "schedule":
         try:
+            _start_scheduling_flow(resolved_user_id)
             target_date = now.date()
             day_context = "today"
             label = f"today, {target_date.strftime('%d %B')}"
@@ -441,6 +712,7 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
             if not times:
                 state.last_intent = "AWAITING_TIME"
                 PENDING_DATA = {"title": extracted_title, "day": day_context}
+                _update_scheduling_flow_data(resolved_user_id, {"title": extracted_title, "day": day_context})
                 return f"At what time should I schedule your '{extracted_title}' for {day_context}, Sir?"
 
             def convert(t):
@@ -482,16 +754,60 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
             if end_dt <= start_dt:
                 end_dt = start_dt + timedelta(hours=1)
 
+            window_events = get_upcoming_events(
+                50,
+                timeMin=start_dt.astimezone(timezone.utc).isoformat(),
+                timeMax=end_dt.astimezone(timezone.utc).isoformat(),
+            )
+            log_step("CALENDAR_EVENTS_FETCHED")
+
+            has_conflict = check_conflict(start_dt, end_dt, window_events)
+            log_step("CONFLICT_CHECK_COMPLETED")
+
+            if has_conflict:
+                log_step("TIME_CONFLICT_DETECTED")
+                suggested_slots = suggest_conflict_free_slots(start_dt, end_dt - start_dt, count=3)
+                log_step("FREE_SLOTS_GENERATED")
+
+                if suggested_slots:
+                    state.last_intent = "AWAITING_CONFLICT_RESOLUTION"
+                    PENDING_CONFLICT = {
+                        "title": extracted_title,
+                        "duration_minutes": int((end_dt - start_dt).total_seconds() // 60),
+                        "slots": suggested_slots,
+                    }
+                    _update_scheduling_flow_data(
+                        resolved_user_id,
+                        {
+                            "title": extracted_title,
+                            "day": day_context,
+                            "slots": suggested_slots,
+                        },
+                    )
+                    requested_time = start_dt.strftime('%I:%M %p')
+                    return (
+                        f"Sir, you already have an event at {requested_time}. Here are some available slots:\n\n"
+                        f"{_format_slot_options(suggested_slots)}\n"
+                        "Would you like me to schedule it at one of these times?"
+                    )
+
+                state.last_intent = "AWAITING_TIME"
+                PENDING_DATA = {"title": extracted_title, "day": day_context}
+                return "Sir, that day appears fully booked. Please say another time or day."
+
             success = create_event(extracted_title, start_dt.isoformat(), end_dt.isoformat())
 
             if success:
+                log_step("EVENT_CREATED")
                 state.last_intent = None
                 PENDING_DATA = {}
+                _end_scheduling_flow(resolved_user_id)
                 return f"Done, Sir. I've scheduled '{extracted_title}' for {label} at {start_dt.strftime('%I:%M %p')}."
 
             # Keep scheduling mode active until creation succeeds.
             state.last_intent = "AWAITING_TIME"
             PENDING_DATA = {"title": extracted_title, "day": day_context}
+            _update_scheduling_flow_data(resolved_user_id, {"title": extracted_title, "day": day_context})
             return "The calendar uplink failed, Sir."
 
         except Exception as e:
@@ -501,10 +817,143 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
             fallback_day = PENDING_DATA.get("day", "today")
             state.last_intent = "AWAITING_TIME"
             PENDING_DATA = {"title": fallback_title, "day": fallback_day}
+            _update_scheduling_flow_data(resolved_user_id, {"title": fallback_title, "day": fallback_day})
             return (
                 f"I am still in scheduling mode for '{fallback_title}' ({fallback_day}), Sir. "
                 "Please provide the time again like 5 PM."
             )
+
+    if intent == "rename":
+        rename_flow_data = dict(_get_user_flow_state(resolved_user_id).get("flow_data") or {})
+        events = get_upcoming_events(15)
+        if not events:
+            return "I do not see any upcoming events to rename, Sir."
+
+        rename_match = re.search(
+            r'(?:rename|retitle|change\s+(?:the\s+)?(?:name|title)\s+(?:of\s+)?)\s+(.+?)\s+(?:to|as)\s+(.+)$',
+            text,
+            flags=re.IGNORECASE,
+        )
+        call_it_match = re.search(r'call\s+(?:it|the\s+event|the\s+meeting)\s+(.+)$', text, flags=re.IGNORECASE)
+
+        old_title_hint = None
+        new_title = None
+        if rename_match:
+            old_title_hint = rename_match.group(1).strip(" .?")
+            new_title = rename_match.group(2).strip(" .?")
+        elif call_it_match:
+            new_title = call_it_match.group(1).strip(" .?")
+
+        if not old_title_hint:
+            old_title_hint = str(rename_flow_data.get("old_title_hint") or "").strip() or None
+        if not new_title:
+            flow_title = str(rename_flow_data.get("new_title") or "").strip()
+            new_title = flow_title or None
+
+        if not new_title:
+            _start_rename_flow(resolved_user_id, rename_flow_data)
+            return "Please tell me the new event title, Sir. For example: rename meeting to Project Review."
+
+        target_event = None
+        time_tokens = _extract_time_tokens(text)
+        if not time_tokens and rename_flow_data.get("target_hour") is not None:
+            time_tokens = [
+                (
+                    str(int(rename_flow_data.get("target_hour") or 0)),
+                    str(int(rename_flow_data.get("target_minute") or 0)).zfill(2),
+                    str(rename_flow_data.get("target_meridiem") or ""),
+                )
+            ]
+        if time_tokens:
+            try:
+                target_hour, target_minute = _convert_time_token(time_tokens[0], require_meridiem=False)
+            except ValueError:
+                return "Please specify AM or PM for the event time, Sir."
+
+            if "tomorrow" in text:
+                target_date = now.date() + timedelta(days=1)
+                target_day_hint = "tomorrow"
+            elif "today" in text:
+                target_date = now.date()
+                target_day_hint = "today"
+            else:
+                target_day_hint = str(rename_flow_data.get("target_day") or "today")
+                target_date = now.date() + timedelta(days=1) if target_day_hint == "tomorrow" else now.date()
+
+            desired_start = datetime.combine(
+                target_date,
+                datetime.min.time().replace(hour=target_hour, minute=target_minute),
+            ).replace(tzinfo=IST)
+
+            best_candidate = None
+            best_delta_minutes = 10**9
+
+            for event in events:
+                start_raw = event.get("start", {}).get("dateTime") or event.get("start", {}).get("date")
+                if not start_raw:
+                    continue
+
+                try:
+                    event_start = datetime.fromisoformat(start_raw.replace("Z", "+00:00")).astimezone(IST)
+                except Exception:
+                    try:
+                        event_start = datetime.strptime(start_raw, "%Y-%m-%d").replace(tzinfo=IST)
+                    except Exception:
+                        continue
+
+                if event_start.date() != target_date:
+                    continue
+
+                delta_minutes = abs(int((event_start - desired_start).total_seconds() // 60))
+                if delta_minutes < best_delta_minutes:
+                    best_delta_minutes = delta_minutes
+                    best_candidate = event
+
+            # 45-minute window covers small STT rounding issues while still being specific.
+            if best_candidate is not None and best_delta_minutes <= 45:
+                target_event = best_candidate
+            else:
+                requested_time = desired_start.strftime('%I:%M %p')
+                requested_day = "tomorrow" if target_date != now.date() else "today"
+                _start_rename_flow(
+                    resolved_user_id,
+                    {
+                        "new_title": new_title,
+                        "old_title_hint": old_title_hint or "",
+                        "target_hour": target_hour,
+                        "target_minute": target_minute,
+                        "target_meridiem": time_tokens[0][2] if len(time_tokens[0]) >= 3 else "",
+                        "target_day": target_day_hint,
+                    },
+                )
+                return f"I could not find an event around {requested_time} {requested_day} to rename, Sir."
+
+        generic_hints = {"meeting", "event", "it", "this", "my meeting", "the meeting", "the event"}
+        if target_event is None and old_title_hint and old_title_hint not in generic_hints:
+            for event in events:
+                summary = str(event.get("summary") or "").lower()
+                if not summary:
+                    continue
+                if old_title_hint in summary or summary in old_title_hint:
+                    target_event = event
+                    break
+
+        if target_event is None:
+            target_event = events[0]
+
+        current_title = str(target_event.get("summary") or "Meeting")
+        if current_title.lower() == new_title.lower():
+            _end_scheduling_flow(resolved_user_id)
+            return f"Sir, that event is already named '{current_title}'."
+
+        success = rename_event_title(target_event, new_title)
+        if success:
+            log_step("EVENT_RENAMED")
+            _end_scheduling_flow(resolved_user_id)
+            return f"Done, Sir. I renamed '{current_title}' to '{new_title}'."
+
+        _start_rename_flow(resolved_user_id, {"new_title": new_title, "old_title_hint": old_title_hint or ""})
+        return "I could not rename the event right now, Sir."
 
     if intent == "cancel":
         events = get_upcoming_events(10)
