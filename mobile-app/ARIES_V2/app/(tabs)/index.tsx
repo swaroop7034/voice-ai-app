@@ -17,7 +17,7 @@ import { useRouter } from "expo-router";
 
 const { width } = Dimensions.get("window");
 
-const BASE_URL  = "http://192.168.1.4:8000";
+const BASE_URL  = "http://10.39.74.10:8000";
 const CHAT_URL  = `${BASE_URL}/chat`;
 const ALERT_URL = `${BASE_URL}/check-alerts`;
 
