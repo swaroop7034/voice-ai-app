@@ -12,7 +12,7 @@ from logger import log_debug, log_error, log_request, log_response, log_step
 
 from core.state import alert_queue
 from core.stt_engine import speech_to_text
-from core.brain import process_text, handle_alert_event
+from core.brain import classify_intent, process_text, handle_alert_event
 from core.tts_engine import text_to_speech
 from core.proactive_agent import monitor_schedule
 from core.memory_classifier import classify_and_store_background
@@ -34,6 +34,36 @@ IST = timezone(timedelta(hours=5, minutes=30))
 SAFE_FOLDER_KEYWORD = "private files"
 VOICE_RESET_STATE: dict[str, str] = {}
 
+BLOCKED_MEMORY_INTENTS = {
+    "scheduling",
+    "voice_reset",
+    "voice_auth",
+    "system_command",
+    "private_operation",
+    "confirmation_reply",
+}
+BLOCKED_MEMORY_KEYWORDS = {
+    "reset voice",
+    "reset my voice",
+    "delete my voice",
+    "delete voice",
+    "schedule",
+    "meeting",
+    "appointment",
+    "private files",
+    "voice auth",
+}
+CONFIRMATION_TEXTS = {
+    "yes",
+    "ok",
+    "okay",
+    "confirm",
+    "sure",
+    "go ahead",
+    "do it",
+    "yep",
+}
+
 os.makedirs("temp_audio/incoming", exist_ok=True)
 os.makedirs("temp_audio/outgoing", exist_ok=True)
 
@@ -49,10 +79,46 @@ def _synthesize_audio_base64(text: str, output_path: str) -> str:
         return base64.b64encode(audio_file.read()).decode("utf-8")
 
 
+def _detect_memory_intent(user_text: str) -> str:
+    normalized = (user_text or "").strip().lower()
+    if normalized in CONFIRMATION_TEXTS:
+        return "confirmation_reply"
+
+    if any(phrase in normalized for phrase in {"reset voice", "reset my voice", "delete my voice", "delete voice"}):
+        return "voice_reset"
+
+    if any(phrase in normalized for phrase in {"private files", "voice auth", "safe folder"}):
+        return "voice_auth"
+
+    detected = classify_intent(normalized)
+    if detected in {"schedule", "reschedule", "rename", "cancel", "query_event"}:
+        return "scheduling"
+
+    return detected
+
+
+def should_store_memory(intent: str, text: str) -> bool:
+    normalized = (text or "").strip().lower()
+    if len(normalized) < 5:
+        return False
+
+    if normalized in CONFIRMATION_TEXTS:
+        return False
+
+    if intent in BLOCKED_MEMORY_INTENTS:
+        return False
+
+    if any(keyword in normalized for keyword in BLOCKED_MEMORY_KEYWORDS):
+        return False
+
+    return True
+
+
 async def _auto_generate_and_attach_suggestion(
     resolved_user_id: str,
     user_query: str,
     aries_reply: str,
+    memory_intent: str,
 ) -> tuple[str, list[str], bool]:
     """
     Generate and deliver suggestion in the same interaction response.
@@ -60,16 +126,21 @@ async def _auto_generate_and_attach_suggestion(
     """
     suggestion_texts: list[str] = []
     try:
-        await asyncio.wait_for(
-            classify_and_store_background(
-                user_id=resolved_user_id,
-                user_text=user_query,
-                aries_text=aries_reply,
-                store_callback=log_interaction,
-                update_profile_callback=update_user_profile,
-            ),
-            timeout=3.0,
-        )
+        if should_store_memory(memory_intent, user_query):
+            await asyncio.wait_for(
+                classify_and_store_background(
+                    user_id=resolved_user_id,
+                    user_text=user_query,
+                    aries_text=aries_reply,
+                    store_callback=log_interaction,
+                    update_profile_callback=update_user_profile,
+                ),
+                timeout=3.0,
+            )
+            log_step("MEMORY_SAVED")
+        else:
+            log_step(f"MEMORY_SKIPPED (intent={memory_intent})")
+
         await asyncio.wait_for(maybe_run_behavior_cycle(resolved_user_id, interaction_step=1), timeout=2.5)
 
         suggestions = await fetch_unseen_suggestions(resolved_user_id, limit=1)
@@ -92,13 +163,19 @@ async def _trigger_background_personalization(user_id: str | None, user_text: st
     Trigger memory classification and profile update in background without waits.
     """
     try:
-        await classify_and_store_background(
-            user_id=user_id,
-            user_text=user_text,
-            aries_text=aries_reply,
-            store_callback=log_interaction,
-            update_profile_callback=update_user_profile,
-        )
+        memory_intent = _detect_memory_intent(user_text)
+        if should_store_memory(memory_intent, user_text):
+            await classify_and_store_background(
+                user_id=user_id,
+                user_text=user_text,
+                aries_text=aries_reply,
+                store_callback=log_interaction,
+                update_profile_callback=update_user_profile,
+            )
+            log_step("MEMORY_SAVED")
+        else:
+            log_step(f"MEMORY_SKIPPED (intent={memory_intent})")
+
         await maybe_run_behavior_cycle(user_id)
     except Exception as e:
         log_error(f"Background personalization error: {e}")
@@ -119,12 +196,14 @@ async def handle_text_input(background_tasks: BackgroundTasks, body: TextInput):
 
     resolved_user_id = _resolve_user_id(body.user_id)
     log_request(f"User: {user_query}")
+    memory_intent = _detect_memory_intent(user_query)
 
     aries_reply = await process_text(user_query, resolved_user_id)
     aries_reply, suggestion_texts, completed_inline = await _auto_generate_and_attach_suggestion(
         resolved_user_id,
         user_query,
         aries_reply,
+        memory_intent,
     )
 
     if not completed_inline:
@@ -399,10 +478,12 @@ async def handle_voice_chat(
         }
 
     aries_reply = await process_text(user_query, resolved_user_id)
+    memory_intent = _detect_memory_intent(user_query)
     aries_reply, suggestion_texts, completed_inline = await _auto_generate_and_attach_suggestion(
         resolved_user_id,
         user_query,
         aries_reply,
+        memory_intent,
     )
 
     if not completed_inline:
