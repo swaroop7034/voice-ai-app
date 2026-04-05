@@ -8,17 +8,31 @@ __pycache__/
 # Python
 *.py[cod]
 venv/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
 
 # Aries Temp Files
 temp_audio/incoming/*
 temp_audio/outgoing/*
+server-backend/temp_audio/incoming/*
+server-backend/temp_audio/outgoing/*
 
 # Google API (Keep these private!)
 data/token.json
 data/credentials.json
+server-backend/.env
 
 # OS files
 .DS_Store
+Thumbs.db
 
 server-backend/data/token.json
 server-backend/data/credentials.json
+
+# VS Code local settings
+.vscode/settings.json

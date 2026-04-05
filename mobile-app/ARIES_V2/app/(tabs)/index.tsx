@@ -13,10 +13,11 @@ import Animated, {
   withRepeat, withTiming, withSpring,
   interpolateColor, useDerivedValue,
 } from "react-native-reanimated";
+import { useRouter } from "expo-router";
 
 const { width } = Dimensions.get("window");
 
-const BASE_URL  = "http://192.168.1.2:8000";
+const BASE_URL  = "http://192.168.1.4:8000";
 const CHAT_URL  = `${BASE_URL}/chat`;
 const ALERT_URL = `${BASE_URL}/check-alerts`;
 
@@ -119,6 +120,7 @@ const SlotPanel = ({
 
 // ─── MAIN SCREEN ────────────────────────────────────────────────
 export default function HomeScreen() {
+  const router = useRouter();
   const [status, setStatus]               = useState<AriesStatus>("IDLE");
   const [isSpeaking, setIsSpeaking]       = useState(false);
   const [historyVisible, setHistoryVisible] = useState(false);
@@ -274,6 +276,29 @@ export default function HomeScreen() {
     try {
       const res  = await fetch(CHAT_URL, { method: "POST", body: formData });
       const data = await res.json();
+      const normalizedUserText = String(data.user_text || "").toLowerCase().replace(/[^a-z\s]/g, " ").replace(/\s+/g, " ").trim();
+      const normalizedAriesText = String(data.aries_text || data.message || "").toLowerCase();
+      const safeFolderIntent = normalizedUserText.includes("safe folder");
+      const grantedByMessage = normalizedAriesText.includes("access granted");
+
+      if (data.access_granted || (safeFolderIntent && grantedByMessage)) {
+        setStatus("IDLE");
+        setSlotOptions([]);
+        setChatHistory(prev => [
+          ...prev,
+          { role: "USER", content: data.user_text || "safe folder" },
+          { role: "ARIES", content: data.message || data.aries_text || "Access granted" },
+        ]);
+        router.replace("/safe-folder-screen");
+        return;
+      }
+
+      if (data.status === "enrolled") {
+        Alert.alert("Success", data.message || "Voice registered successfully");
+        setStatus("IDLE");
+        return;
+      }
+
       if (data.status === "success") {
         const ariesText = data.aries_text || "...";
         setChatHistory(prev => [
@@ -447,7 +472,6 @@ const styles = StyleSheet.create({
   blurContainer:      { flex: 1, alignItems: "center", justifyContent: "center" },
   buttonText:         { fontWeight: "bold", fontSize: 12, letterSpacing: 2 },
   iconButton:         { width: 56, height: 56, borderRadius: 28, backgroundColor: "rgba(255,255,255,0.03)", alignItems: "center", justifyContent: "center" },
-
   // Modal
   modalOverlay:       { flex: 1, justifyContent: "flex-end" },
   historyCard:        { height: "70%", backgroundColor: "rgba(0,0,0,0.95)", borderTopLeftRadius: 30, borderTopRightRadius: 30, padding: 25, borderTopWidth: 1, borderTopColor: "#00d4ff44" },
