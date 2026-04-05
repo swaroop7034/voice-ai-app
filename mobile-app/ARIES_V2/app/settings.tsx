@@ -15,7 +15,7 @@ import { ProfileCard } from '@/components/settings/ProfileCard';
 import { SettingsSection } from '@/components/settings/SettingsSection';
 import { ToggleSwitch } from '@/components/settings/ToggleSwitch';
 
-const API_BASE = 'http://192.168.1.4:8000';
+const API_BASE = 'http://10.39.74.10:8000';
 
 type UserProfile = {
   name: string;

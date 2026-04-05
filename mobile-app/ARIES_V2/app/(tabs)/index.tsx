@@ -14,10 +14,11 @@ import Animated, {
   interpolateColor, useDerivedValue,
 } from "react-native-reanimated";
 import { useRouter } from "expo-router";
+import { API_BASE_URL } from "@/lib/safeFolderApi";
 
 const { width } = Dimensions.get("window");
 
-const BASE_URL  = "http://10.39.74.10:8000";
+const BASE_URL  = API_BASE_URL;
 const CHAT_URL  = `${BASE_URL}/chat`;
 const ALERT_URL = `${BASE_URL}/check-alerts`;
 
@@ -497,3 +498,4 @@ const styles = StyleSheet.create({
   logRole:            { fontSize: 10, fontWeight: "bold", marginRight: 10 },
   logText:            { color: "#fff", fontSize: 13, flex: 1, fontWeight: "300" },
 });
+
