@@ -87,6 +87,9 @@ def _build_system_prompt(
     profile_context: str = "",
     conversation_context: str = "",
     behavior_context: str = "",
+    *,
+    allow_search_protocol: bool = True,
+    grounded_mode: bool = False,
 ) -> dict[str, str]:
     memory_section = memory_context.strip()
     profile_section = profile_context.strip()
@@ -126,6 +129,18 @@ def _build_system_prompt(
     elif profile_context and "detailed" in profile_context.lower():
         response_style_instruction = "Provide detailed explanations with examples. "
 
+    search_protocol_text = (
+        "SEARCH PROTOCOL: If the user asks about events in 2025 or 2026, current news, weather, live data, "
+        "or details you do not have in your local offline training, you MUST respond strictly with SEARCH[query]. "
+        "Do not guess. Do not be poetic. Just SEARCH. "
+    ) if allow_search_protocol else ""
+
+    grounded_instruction_text = (
+        "GROUNDED MODE: The user message already includes retrieved web context. "
+        "Answer directly from that context and do not output SEARCH[query]. "
+        "If context is insufficient, say: I can't verify this on the web right now, so I won't guess. "
+    ) if grounded_mode else ""
+
     return {
         'role': 'system',
         'content': (
@@ -136,9 +151,8 @@ def _build_system_prompt(
             "ANSWERING RULE: Answer correctly first, then add light personality only if it fits and never at the expense of accuracy. "
             f"CURRENT DATE: {today_date}. "
             "IMPORTANT: You are currently in the year 2026. "
-            "SEARCH PROTOCOL: If the user asks about events in 2025 or 2026, current news, weather, live data, "
-            "or details you do not have in your local offline training, you MUST respond strictly with SEARCH[query]. "
-            "Do not guess. Do not be poetic. Just SEARCH. "
+            f"{search_protocol_text}"
+            f"{grounded_instruction_text}"
             "CONSTRAINTS: Keep final responses to 1 or 2 sentences max.\n\n"
             f"{context_block}"
         )
@@ -153,6 +167,8 @@ async def get_aries_response(
     profile_context: str = "",
     behavior_context: str = "",
     recent_history: list[dict[str, str]] | None = None,
+    allow_search_protocol: bool = True,
+    grounded_mode: bool = False,
 ) -> str:
     """
     Communicates with Ollama using per-user sliding-window history, memories, and user profile.
@@ -178,6 +194,8 @@ async def get_aries_response(
             profile_context,
             conversation_context,
             behavior_context,
+            allow_search_protocol=allow_search_protocol,
+            grounded_mode=grounded_mode,
         )
         messages_to_send = [system_prompt, {'role': 'user', 'content': user_text}]
 

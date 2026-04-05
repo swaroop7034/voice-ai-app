@@ -50,6 +50,22 @@ USER_FLOW_STATE: dict[str, dict[str, object]] = {}
 TIME_REGEX = r'(\d{1,2})(?:[:\.](\d{2}))?\s*([ap]\.?m?\.?)'
 LOOSE_TIME_REGEX = r'\b(\d{1,2})(?:[:\.](\d{2}))?\b'
 TIME_QUERY_REGEX = r'\b(what\s+(?:is|s\s+)?(?:the\s+)?time|current\s+time|tell\s+me\s+the\s+time|what\'s\s+the\s+time)\b'
+WEB_VERIFY_KEYWORDS = {
+    "today",
+    "latest",
+    "current",
+    "now",
+    "news",
+    "weather",
+    "live",
+    "score",
+    "price",
+    "version",
+    "released",
+    "launch",
+    "2025",
+    "2026",
+}
 
 # Word → digit map for spoken numbers STT often returns
 _WORD_TO_NUM = {
@@ -305,6 +321,40 @@ def _convert_time_token(token: tuple[str, str, str], require_meridiem: bool = Tr
 def _format_slot_options(slots: list[tuple[datetime, datetime, str]]) -> str:
     lines = [f"{i + 1}. {label} at {start.strftime('%I:%M %p')}" for i, (start, _end, label) in enumerate(slots)]
     return "\n".join(lines)
+
+
+def _has_web_verification_keywords(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(keyword in lowered for keyword in WEB_VERIFY_KEYWORDS)
+
+
+async def _llm_web_route(text: str) -> bool:
+    """Return True when the query should be web-verified before answering."""
+    prompt = (
+        "Decide if this user query requires live web verification before answering. "
+        "Return only one token: SEARCH or LOCAL. "
+        "Use SEARCH for current events, live/fast-changing facts, uncertain claims, "
+        "or anything outside stable offline knowledge.\n"
+        f"Query: {text}"
+    )
+    try:
+        response = await asyncio.to_thread(
+            ollama.generate,
+            model="phi3",
+            prompt=prompt,
+            stream=False,
+        )
+        label = str(response.get("response", "LOCAL")).strip().upper()
+        return label.startswith("SEARCH")
+    except Exception as exc:
+        log_error(f"WEB ROUTER fallback failed: {exc}")
+        return False
+
+
+async def _should_verify_with_web(user_text: str) -> bool:
+    if _has_web_verification_keywords(user_text):
+        return True
+    return await _llm_web_route(user_text)
 
 
 # ─────────────────────────────────────────────
@@ -1027,6 +1077,31 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
 
     log_step("CONTEXT_BUILD_COMPLETED")
 
+    should_verify_web = await _should_verify_with_web(user_text)
+    if should_verify_web:
+        log_step("WEB_VERIFY_TRIGGERED")
+        web_data = fetch_live_info(user_text)
+        if not web_data or web_data.startswith("Search error:"):
+            return "I can't verify this on the web right now, so I won't guess."
+
+        refined = (
+            "Verified web context below. Answer factually from this context. "
+            "If the answer is missing, say you cannot verify.\n"
+            f"Web context:\n{web_data}\n"
+            f"User asked: {user_text}\n"
+            "Reply in 1-2 sentences and include one source title when relevant."
+        )
+        return await get_aries_response(
+            refined,
+            resolved_user_id,
+            memory_context=memory_context,
+            profile_context=profile_context,
+            behavior_context=behavior_context,
+            recent_history=recent_history[-MAX_HISTORY:],
+            allow_search_protocol=False,
+            grounded_mode=True,
+        )
+
     response = await get_aries_response(
         user_text,
         resolved_user_id,
@@ -1040,6 +1115,8 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
         try:
             query    = response.split("SEARCH", 1)[-1].strip(" []:")
             web_data = fetch_live_info(query)
+            if not web_data or web_data.startswith("Search error:"):
+                return "I can't verify this on the web right now, so I won't guess."
             refined  = (
                 f"Found info: {web_data}\n"
                 f"User asked: {user_text}\n"
@@ -1051,9 +1128,11 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
                 memory_context=memory_context,
                 profile_context=profile_context,
                 behavior_context=behavior_context,
+                allow_search_protocol=False,
+                grounded_mode=True,
             )
         except Exception:
-            return "Web search failed. Relying on local core."
+            return "I can't verify this on the web right now, so I won't guess."
 
     return response
 
