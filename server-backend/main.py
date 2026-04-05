@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
 import uvicorn
 import os
@@ -27,6 +27,13 @@ from core.voice_auth import (
     verify_safe_folder_access,
 )
 from integrations.supabase_store import log_interaction, get_default_user_id
+from core.vault_storage import (
+    save_vault_file,
+    list_vault_files,
+    get_vault_storage_stats,
+    get_vault_file_path,
+    delete_vault_file,
+)
 
 app = FastAPI()
 
@@ -581,8 +588,99 @@ async def safe_folder_access(
             os.remove(input_path)
 
 
+
+# --- SAFE FOLDER FILE UPLOAD ---
+@app.post("/safe-folder/files/upload")
+async def safe_folder_upload_file(
+    file: UploadFile = File(...),
+    user_id: str | None = Form(default=None),
+):
+    resolved_user_id = _resolve_user_id(user_id)
+
+    try:
+        stored_file = await save_vault_file(file, resolved_user_id)
+        stats = get_vault_storage_stats(resolved_user_id)
+        return {
+            "status": "success",
+            "user_id": resolved_user_id,
+            "file": stored_file,
+            "stats": stats,
+        }
+    except Exception as exc:
+        log_error(f"SAFE_FOLDER_UPLOAD_FAILED user_id={resolved_user_id}: {exc}")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "message": "Unable to upload file right now."},
+        )
+
+
+# --- SAFE FOLDER FILE LIST + STORAGE STATS ---
+@app.get("/safe-folder/files")
+async def safe_folder_list_files(user_id: str | None = None):
+    resolved_user_id = _resolve_user_id(user_id)
+    files = list_vault_files(resolved_user_id)
+    stats = get_vault_storage_stats(resolved_user_id)
+
+    return {
+        "status": "success",
+        "user_id": resolved_user_id,
+        "files": files,
+        "stats": stats,
+    }
+
+
+# --- SAFE FOLDER FILE OPEN (inline) ---
+@app.get("/safe-folder/files/{file_id}/open")
+async def safe_folder_open_file(file_id: str, user_id: str | None = None):
+    resolved_user_id = _resolve_user_id(user_id)
+    file_path = get_vault_file_path(resolved_user_id, file_id)
+    if file_path is None:
+        return JSONResponse(status_code=404, content={"status": "error", "message": "File not found."})
+
+    display_name = file_path.name.split("_", 2)[-1] if "_" in file_path.name else file_path.name
+    return FileResponse(
+        path=str(file_path),
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'inline; filename="{display_name}"'},
+    )
+
+
+# --- SAFE FOLDER FILE DOWNLOAD ---
+@app.get("/safe-folder/files/{file_id}/download")
+async def safe_folder_download_file(file_id: str, user_id: str | None = None):
+    resolved_user_id = _resolve_user_id(user_id)
+    file_path = get_vault_file_path(resolved_user_id, file_id)
+    if file_path is None:
+        return JSONResponse(status_code=404, content={"status": "error", "message": "File not found."})
+
+    display_name = file_path.name.split("_", 2)[-1] if "_" in file_path.name else file_path.name
+    return FileResponse(
+        path=str(file_path),
+        filename=display_name,
+        media_type="application/octet-stream",
+    )
+
+
+# --- SAFE FOLDER FILE DELETE ---
+@app.delete("/safe-folder/files/{file_id}")
+async def safe_folder_delete_file(file_id: str, user_id: str | None = None):
+    resolved_user_id = _resolve_user_id(user_id)
+    removed = delete_vault_file(resolved_user_id, file_id)
+    if not removed:
+        return JSONResponse(status_code=404, content={"status": "error", "message": "File not found."})
+
+    files = list_vault_files(resolved_user_id)
+    stats = get_vault_storage_stats(resolved_user_id)
+    return {
+        "status": "success",
+        "user_id": resolved_user_id,
+        "files": files,
+        "stats": stats,
+    }
+
 if __name__ == "__main__":
     watcher_thread = threading.Thread(target=monitor_schedule, daemon=True)
     watcher_thread.start()
     log_step("PROACTIVE_WATCHER_STARTED")
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
