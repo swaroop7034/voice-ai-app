@@ -410,7 +410,7 @@ export default function HomeScreen() {
             </BlurView>
           </TouchableOpacity>
 
-          <TouchableOpacity style={styles.iconButton}>
+          <TouchableOpacity style={styles.iconButton} onPress={() => router.push('/settings')}>
             <Ionicons name="settings-outline" size={26} color="rgba(255,255,255,0.4)" />
           </TouchableOpacity>
         </View>
