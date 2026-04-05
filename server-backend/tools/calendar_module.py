@@ -71,7 +71,21 @@ def get_upcoming_events(max_results=10, timeMin=None, timeMax=None):
             params['timeMax'] = timeMax
 
         events = service.events().list(**params).execute()
-        return events.get('items', [])
+        items = events.get('items', [])
+
+        # Best-effort sync of Google-detected events into Supabase.
+        try:
+            from integrations.supabase_store import get_default_user_id, sync_calendar_events_sync
+
+            sync_calendar_events_sync(
+                user_id=get_default_user_id(),
+                events=items,
+                source="google_calendar_detected",
+            )
+        except Exception as sync_exc:
+            print(f"[CALENDAR SYNC] detect->supabase sync failed: {sync_exc}")
+
+        return items
 
     except Exception as e:
         print(f"[ERROR FETCHING] {e}")
@@ -426,7 +440,20 @@ def create_event(summary, start_iso, end_iso):
             'start': {'dateTime': start_iso, 'timeZone': 'Asia/Kolkata'},
             'end':   {'dateTime': end_iso,   'timeZone': 'Asia/Kolkata'},
         }
-        service.events().insert(calendarId='primary', body=event).execute()
+        created_event = service.events().insert(calendarId='primary', body=event).execute()
+
+        # Best-effort sync of ARIS-created event into Supabase.
+        try:
+            from integrations.supabase_store import get_default_user_id, upsert_calendar_event_sync
+
+            upsert_calendar_event_sync(
+                user_id=get_default_user_id(),
+                event=created_event,
+                source="aris_created",
+            )
+        except Exception as sync_exc:
+            print(f"[CALENDAR SYNC] aris_created->supabase sync failed: {sync_exc}")
+
         return True
     except Exception as e:
         print(f"[Create Error] {e}")

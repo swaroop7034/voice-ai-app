@@ -1,8 +1,10 @@
 import asyncio
 import re
 from datetime import datetime, timedelta, timezone
+import ollama
 from core.llm_manager import get_aries_response, get_recent_chat_history
 from core.memory_classifier import classify_and_store_background
+from core.behavior_analyzer import build_behavior_context
 from core.user_profile import get_user_profile, update_user_profile, format_profile_section
 from core.intelligence_layer import (
     MAX_HISTORY,
@@ -39,6 +41,7 @@ PENDING_RESCHEDULE = {}
 #  STT CLEANUP
 # ─────────────────────────────────────────────
 TIME_REGEX = r'(\d{1,2})(?:[:\.](\d{2}))?\s*([ap]\.?m?\.?)'
+LOOSE_TIME_REGEX = r'\b(\d{1,2})(?:[:\.](\d{2}))?\b'
 TIME_QUERY_REGEX = r'\b(what\s+(?:is|s\s+)?(?:the\s+)?time|current\s+time|tell\s+me\s+the\s+time|what\'s\s+the\s+time)\b'
 
 # Word → digit map for spoken numbers STT often returns
@@ -96,6 +99,14 @@ RESCHEDULE_TRIGGERS = [
 CONFIRM_WORDS  = ["yes", "fine", "ok", "sure", "yep", "confirm", "do it", "go ahead", "sounds good"]
 DECLINE_WORDS  = ["no", "don't", "cancel", "stop", "never mind", "skip"]
 
+SCHEDULE_KEYWORDS = ["schedule", "add", "set", "book", "create", "plan", "meeting", "appointment"]
+RESCHEDULE_KEYWORDS = [
+    "reschedule", "move", "shift", "change", "postpone", "another slot", "different time", "can't make",
+]
+CANCEL_KEYWORDS = ["cancel", "drop", "remove", "delete", "call off"]
+QUERY_EVENT_KEYWORDS = ["agenda", "events", "meeting", "schedule", "plans"]
+QUERY_VERBS = ["what", "show", "list", "check", "tell"]
+
 
 def _is_reschedule_intent(text: str) -> bool:
     # Exact trigger words
@@ -107,12 +118,87 @@ def _is_reschedule_intent(text: str) -> bool:
     return False
 
 
+def classify_intent(text: str) -> str:
+    """Rule-first classifier returning schedule|reschedule|cancel|query_event|general|uncertain."""
+    txt = text.lower().strip()
+
+    reschedule_hits = sum(1 for keyword in RESCHEDULE_KEYWORDS if keyword in txt)
+    if _is_reschedule_intent(txt):
+        reschedule_hits += 2
+
+    cancel_hits = sum(1 for keyword in CANCEL_KEYWORDS if keyword in txt)
+    schedule_hits = sum(1 for keyword in SCHEDULE_KEYWORDS if keyword in txt)
+    query_hits = sum(1 for keyword in QUERY_EVENT_KEYWORDS if keyword in txt)
+    query_verb_hits = sum(1 for keyword in QUERY_VERBS if keyword in txt)
+    has_time = bool(re.search(TIME_REGEX, txt))
+
+    if reschedule_hits >= 2:
+        return "reschedule"
+    if cancel_hits >= 2 and reschedule_hits == 0:
+        return "cancel"
+    if query_hits >= 1 and query_verb_hits >= 1 and not has_time:
+        return "query_event"
+    if schedule_hits >= 2 and (has_time or "tomorrow" in txt or "today" in txt):
+        return "schedule"
+    # If user is clearly asking to schedule but omitted explicit time/day, enter scheduling flow.
+    if schedule_hits >= 1 and query_verb_hits == 0 and cancel_hits == 0 and reschedule_hits == 0:
+        return "schedule"
+
+    # Weak/ambiguous calendar language should be resolved by LLM fallback.
+    weak_calendar_signal = (schedule_hits + query_hits + cancel_hits + reschedule_hits) >= 1
+    if weak_calendar_signal:
+        return "uncertain"
+
+    return "general"
+
+
+async def classify_intent_with_llm(text: str) -> str:
+    prompt = (
+        "Classify this request into one of [schedule, reschedule, cancel, general]. "
+        "Return only one word.\n"
+        f"Request: {text}"
+    )
+    try:
+        response = await asyncio.to_thread(
+            ollama.generate,
+            model="phi3",
+            prompt=prompt,
+            stream=False,
+        )
+        label = str(response.get("response", "general")).strip().lower()
+        label = re.sub(r"[^a-z_]", "", label)
+        if label in {"schedule", "reschedule", "cancel", "general"}:
+            return label
+        return "general"
+    except Exception as exc:
+        print(f"[INTENT] LLM fallback failed: {exc}")
+        return "general"
+
+
 def _reset_state():
     global PENDING_DATA, PENDING_RESCHEDULE
     state.last_intent         = None
     state.current_alert_event = None
     PENDING_DATA              = {}
     PENDING_RESCHEDULE        = {}
+
+
+def _extract_time_tokens(text: str) -> list[tuple[str, str, str]]:
+    strict_matches = re.findall(TIME_REGEX, text)
+    if strict_matches:
+        return [(str(h), str(m), str(ap)) for h, m, ap in strict_matches]
+
+    # Loose fallback for replies like "5" or "17:30" when ARIS is awaiting time.
+    loose_matches = re.findall(LOOSE_TIME_REGEX, text)
+    tokens: list[tuple[str, str, str]] = []
+    for hour_raw, minute_raw in loose_matches:
+        try:
+            hour = int(hour_raw)
+        except Exception:
+            continue
+        if 0 <= hour <= 23:
+            tokens.append((str(hour_raw), str(minute_raw or ""), ""))
+    return tokens
 
 
 # ─────────────────────────────────────────────
@@ -200,19 +286,39 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
     # ══════════════════════════════════════════
     #  STEP 3 — CONTEXT RECOVERY (awaiting time)
     # ══════════════════════════════════════════
-    if state.last_intent == "AWAITING_TIME" and re.search(TIME_REGEX, text):
-        saved_title = PENDING_DATA.get('title', 'Meeting')
-        text = f"schedule {saved_title} " + text
-        if PENDING_DATA.get('day') == 'tomorrow':
-            text += " tomorrow"
-    elif state.last_intent == "AWAITING_TIME" and not re.search(TIME_REGEX, text):
-        state.last_intent = None
-        PENDING_DATA = {}
+    force_schedule_intent = False
+    if state.last_intent == "AWAITING_TIME":
+        extracted_times = _extract_time_tokens(text)
+        if extracted_times:
+            saved_title = PENDING_DATA.get('title', 'Meeting')
+            day_hint = PENDING_DATA.get('day', 'today')
+            text = f"schedule {saved_title} " + text
+            if day_hint == 'tomorrow':
+                text += " tomorrow"
+            force_schedule_intent = True
+        else:
+            saved_title = PENDING_DATA.get('title', 'Meeting')
+            day_hint = PENDING_DATA.get('day', 'today')
+            return (
+                f"I am still waiting for the time to schedule '{saved_title}' for {day_hint}, Sir. "
+                "Please say a time like 5 PM or 17:30."
+            )
+
+    intent = classify_intent(text)
+    intent_source = "rule"
+    if intent == "uncertain":
+        fallback_intent = await classify_intent_with_llm(text)
+        intent = "query_event" if fallback_intent == "general" and any(v in text for v in QUERY_VERBS) and any(k in text for k in QUERY_EVENT_KEYWORDS) else fallback_intent
+        intent_source = "llm"
+    if force_schedule_intent:
+        intent = "schedule"
+        intent_source = "context"
+    print(f"[INTENT] source={intent_source} final_intent={intent} text={text}")
 
     # ══════════════════════════════════════════
     #  STEP 4 — STANDALONE RESCHEDULE INTENT
     # ══════════════════════════════════════════
-    if _is_reschedule_intent(text):
+    if intent == "reschedule":
         target_event = None
         events = get_upcoming_events(10)
 
@@ -256,8 +362,7 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
     # ══════════════════════════════════════════
     #  STEP 5 — CALENDAR READING
     # ══════════════════════════════════════════
-    if any(w in text for w in ["schedule", "schedules", "agenda", "plans", "events", "meetings"]) \
-       and any(q in text for q in ["what", "show", "list", "check", "tell"]):
+    if intent == "query_event":
 
         state.last_intent = None
         if "today" in text:
@@ -307,7 +412,7 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
     # ══════════════════════════════════════════
     #  STEP 6 — SCHEDULING
     # ══════════════════════════════════════════
-    if any(word in text for word in ["schedule", "add a", "set an", "have a"]):
+    if intent == "schedule":
         try:
             target_date = now.date()
             day_context = "today"
@@ -318,7 +423,7 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
                 label = f"tomorrow, {target_date.strftime('%d %B')}"
                 day_context = "tomorrow"
 
-            times = re.findall(TIME_REGEX, text)
+            times = _extract_time_tokens(text)
 
             title_match = re.search(
                 r'(?:have|schedule|add|set)\s+(?:a|an|my)?\s*(.*?)\s*(?:for|at|on|tomorrow|today|$)',
@@ -343,18 +448,29 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
                 hour     = int(t[0])
                 minute   = int(t[1]) if t[1] else 0
                 meridiem = t[2].replace('.', '').lower()
+                if not meridiem:
+                    if hour > 12:
+                        return hour, minute
+                    # Avoid wrong scheduling when user says only "5" or "5:30".
+                    raise ValueError("Ambiguous time without AM/PM")
                 if 'p' in meridiem and hour < 12: hour += 12
                 if 'a' in meridiem and hour == 12: hour = 0
                 return hour, minute
 
-            sh, sm = convert(times[0])
+            try:
+                sh, sm = convert(times[0])
+            except ValueError:
+                return "Please specify AM or PM for the time, Sir."
             start_dt = datetime.combine(
                 target_date,
                 datetime.min.time().replace(hour=sh, minute=sm)
             ).replace(tzinfo=IST)
 
             if "to" in text and len(times) >= 2:
-                eh, em = convert(times[1])
+                try:
+                    eh, em = convert(times[1])
+                except ValueError:
+                    return "Please specify AM or PM for the end time as well, Sir."
                 end_dt = datetime.combine(
                     target_date,
                     datetime.min.time().replace(hour=eh, minute=em)
@@ -374,12 +490,42 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
                 PENDING_DATA = {}
                 return f"Done, Sir. I've scheduled '{extracted_title}' for {label} at {start_dt.strftime('%I:%M %p')}."
 
+            # Keep scheduling mode active until creation succeeds.
+            state.last_intent = "AWAITING_TIME"
+            PENDING_DATA = {"title": extracted_title, "day": day_context}
             return "The calendar uplink failed, Sir."
 
         except Exception as e:
             print(f"Scheduling Error: {e}")
-            state.last_intent = None
-            return "I encountered a logic error while scheduling, Sir."
+            # Do not exit scheduling mode on parser/runtime issues.
+            fallback_title = PENDING_DATA.get("title", "Meeting")
+            fallback_day = PENDING_DATA.get("day", "today")
+            state.last_intent = "AWAITING_TIME"
+            PENDING_DATA = {"title": fallback_title, "day": fallback_day}
+            return (
+                f"I am still in scheduling mode for '{fallback_title}' ({fallback_day}), Sir. "
+                "Please provide the time again like 5 PM."
+            )
+
+    if intent == "cancel":
+        events = get_upcoming_events(10)
+        if not events:
+            return "There are no upcoming events to cancel, Sir."
+
+        target = None
+        for event in events:
+            summary = str(event.get("summary") or "").lower()
+            if summary and summary in text:
+                target = event
+                break
+        if target is None:
+            target = events[0]
+
+        title = target.get("summary", "the event")
+        return (
+            f"Cancel intent detected for '{title}', Sir. "
+            "Direct cancellation is currently disabled in this build; say 'reschedule it' for immediate handling."
+        )
 
     # ══════════════════════════════════════════
     #  STEP 7 — QUICK RESPONSES
@@ -400,7 +546,13 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
     memory_task = asyncio.create_task(search_similar(user_text, resolved_user_id, limit=8))
     history_task = asyncio.create_task(get_recent_chat_history(resolved_user_id, limit=MAX_HISTORY))
     profile_task = asyncio.create_task(get_user_profile(resolved_user_id))
-    retrieved_memories, recent_history, profile = await asyncio.gather(memory_task, history_task, profile_task)
+    behavior_task = asyncio.create_task(build_behavior_context(resolved_user_id, limit=3))
+    retrieved_memories, recent_history, profile, behavior_context = await asyncio.gather(
+        memory_task,
+        history_task,
+        profile_task,
+        behavior_task,
+    )
 
     decayed_memories = apply_memory_decay(retrieved_memories)
     memory_candidates, preference_memories = filter_memories_by_type(decayed_memories)
@@ -427,12 +579,14 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
         f"memories_used={len(selected_memories)} history_used={len(recent_history[-MAX_HISTORY:])}"
     )
     print(f"[INTELLIGENCE] compressed_context={compressed_points}")
+    print(f"[INTELLIGENCE] behavior_context={behavior_context}")
 
     response = await get_aries_response(
         user_text,
         resolved_user_id,
         memory_context=memory_context,
         profile_context=profile_context,
+        behavior_context=behavior_context,
         recent_history=recent_history[-MAX_HISTORY:],
     )
 
@@ -449,6 +603,8 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
                 refined,
                 resolved_user_id,
                 memory_context=memory_context,
+                profile_context=profile_context,
+                behavior_context=behavior_context,
             )
         except Exception:
             return "Web search failed. Relying on local core."
@@ -461,6 +617,9 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
 # ─────────────────────────────────────────────
 def handle_alert_event(event: dict) -> str:
     """Sets shared state and returns the spoken alert message."""
+    if str(event.get("event_type") or "").lower() == "behavior_suggestion":
+        return str(event.get("message") or "Sir, I have a behavior suggestion for you.")
+
     state.last_intent         = "CONFIRMING_ALERT"
     state.current_alert_event = event
 

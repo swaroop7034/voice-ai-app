@@ -78,10 +78,17 @@ def _conversation_section(recent_history: list[dict[str, str]], limit: int = MAX
     return "\n".join(lines) if lines else "* No recent conversation available."
 
 
-def _build_system_prompt(today_date: str, memory_context: str, profile_context: str = "", conversation_context: str = "") -> dict[str, str]:
+def _build_system_prompt(
+    today_date: str,
+    memory_context: str,
+    profile_context: str = "",
+    conversation_context: str = "",
+    behavior_context: str = "",
+) -> dict[str, str]:
     memory_section = memory_context.strip()
     profile_section = profile_context.strip()
     conversation_section = conversation_context.strip()
+    behavior_section = behavior_context.strip()
 
     context_blocks: list[str] = []
 
@@ -96,6 +103,11 @@ def _build_system_prompt(today_date: str, memory_context: str, profile_context: 
         context_blocks.append("Relevant Context:\n* No reliable memory context found.")
 
     context_blocks.append(f"Conversation:\n{conversation_section or '* No recent conversation available.'}")
+
+    if behavior_section:
+        context_blocks.append(f"User Behavior Insights:\n{behavior_section}")
+    else:
+        context_blocks.append("User Behavior Insights:\n* No stable behavior insights yet.")
 
     context_blocks.append(
         "Instruction:\n"
@@ -151,6 +163,7 @@ async def get_aries_response(
     *,
     memory_context: str = "",
     profile_context: str = "",
+    behavior_context: str = "",
     recent_history: list[dict[str, str]] | None = None,
 ) -> str:
     """
@@ -172,7 +185,13 @@ async def get_aries_response(
         await append_chat_message(resolved_user_id, 'user', user_text)
 
         conversation_context = _conversation_section(recent_history, limit=MAX_HISTORY)
-        system_prompt = _build_system_prompt(today_date, memory_context, profile_context, conversation_context)
+        system_prompt = _build_system_prompt(
+            today_date,
+            memory_context,
+            profile_context,
+            conversation_context,
+            behavior_context,
+        )
         messages_to_send = [system_prompt, {'role': 'user', 'content': user_text}]
 
         prompt_preview = _format_prompt_preview(messages_to_send)

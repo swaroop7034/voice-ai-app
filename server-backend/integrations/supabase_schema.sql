@@ -42,6 +42,46 @@ create table if not exists public.user_profile (
   updated_at timestamptz default now()
 );
 
+create table if not exists public.behavior_patterns (
+  id bigint generated always as identity primary key,
+  user_id text,
+  pattern_type text,
+  pattern_data jsonb,
+  confidence float,
+  last_updated timestamptz default now()
+);
+
+create table if not exists public.suggestions (
+  id bigint generated always as identity primary key,
+  user_id text,
+  suggestion_text text,
+  created_at timestamptz default now(),
+  seen boolean default false
+);
+
+create table if not exists public.calendar_events (
+  id bigint generated always as identity primary key,
+  user_id text not null,
+  google_event_id text not null,
+  source text not null default 'google_calendar_detected',
+  summary text,
+  description text,
+  location text,
+  status text,
+  start_time timestamptz,
+  end_time timestamptz,
+  event_timezone text,
+  is_all_day boolean default false,
+  attendees jsonb default '[]'::jsonb,
+  organizer_email text,
+  html_link text,
+  updated_at_gcal timestamptz,
+  raw_event jsonb,
+  created_at timestamptz default now(),
+  last_synced_at timestamptz default now(),
+  unique(user_id, google_event_id)
+);
+
 -- 4. Indexes (SAFE)
 create index if not exists inetartction_user_id_idx
   on public.inetartction (user_id);
@@ -59,6 +99,27 @@ create index if not exists inetartction_embedding_idx
 
 create index if not exists user_profile_user_id_idx
   on public.user_profile (user_id);
+
+create index if not exists behavior_patterns_user_id_idx
+  on public.behavior_patterns (user_id);
+
+create index if not exists behavior_patterns_confidence_idx
+  on public.behavior_patterns (confidence desc);
+
+create index if not exists suggestions_user_id_seen_idx
+  on public.suggestions (user_id, seen, created_at desc);
+
+create index if not exists calendar_events_user_id_idx
+  on public.calendar_events (user_id);
+
+create index if not exists calendar_events_start_time_idx
+  on public.calendar_events (start_time desc);
+
+create index if not exists calendar_events_source_idx
+  on public.calendar_events (source);
+
+create index if not exists calendar_events_raw_event_idx
+  on public.calendar_events using gin (raw_event);
 
 -- 5. Drop all old versions of function
 do $$

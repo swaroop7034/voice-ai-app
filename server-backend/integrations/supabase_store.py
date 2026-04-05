@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+from datetime import datetime
 from functools import lru_cache
 from typing import Any
 
@@ -394,3 +395,114 @@ async def get_recent_interactions(user_id: str | None, limit: int = 7) -> list[d
 
 def get_default_user_id() -> str:
     return _default_user_id()
+
+
+def _normalize_event_datetime(value: str | None) -> str | None:
+    if not value:
+        return None
+    value = str(value).strip()
+    if not value:
+        return None
+    # Google all-day events are date-only. Store as UTC midnight for consistency.
+    if "T" not in value:
+        return f"{value}T00:00:00+00:00"
+    if value.endswith("Z"):
+        return value.replace("Z", "+00:00")
+    return value
+
+
+def _calendar_event_payload(user_id: str, event: dict[str, Any], source: str) -> dict[str, Any]:
+    start = event.get("start") or {}
+    end = event.get("end") or {}
+
+    start_raw = start.get("dateTime") or start.get("date")
+    end_raw = end.get("dateTime") or end.get("date")
+
+    event_id = str(event.get("id") or "").strip()
+    summary = str(event.get("summary") or "Untitled Event").strip()
+
+    # Fallback key if Google event id is missing.
+    if not event_id:
+        event_id = f"local::{summary}::{start_raw or 'unknown'}"
+
+    attendees = event.get("attendees")
+    if not isinstance(attendees, list):
+        attendees = []
+
+    organizer_email = ""
+    organizer = event.get("organizer") or {}
+    if isinstance(organizer, dict):
+        organizer_email = str(organizer.get("email") or "").strip()
+
+    payload: dict[str, Any] = {
+        "user_id": user_id,
+        "google_event_id": event_id,
+        "source": source,
+        "summary": summary,
+        "description": str(event.get("description") or "").strip() or None,
+        "location": str(event.get("location") or "").strip() or None,
+        "status": str(event.get("status") or "confirmed").strip() or "confirmed",
+        "start_time": _normalize_event_datetime(start_raw),
+        "end_time": _normalize_event_datetime(end_raw),
+        "event_timezone": str(start.get("timeZone") or end.get("timeZone") or "Asia/Kolkata").strip(),
+        "is_all_day": bool(start.get("date") and not start.get("dateTime")),
+        "attendees": attendees,
+        "organizer_email": organizer_email or None,
+        "html_link": str(event.get("htmlLink") or "").strip() or None,
+        "updated_at_gcal": _normalize_event_datetime(str(event.get("updated") or "").strip() or None),
+        "last_synced_at": datetime.utcnow().isoformat() + "Z",
+        "raw_event": event,
+    }
+    return payload
+
+
+def upsert_calendar_event_sync(user_id: str | None, event: dict[str, Any], source: str = "google_calendar_detected") -> bool:
+    """Sync a single calendar event into Supabase table `calendar_events`."""
+    if not interaction_store.enabled or interaction_store.client is None:
+        return False
+
+    resolved_user_id = user_id.strip() if user_id and user_id.strip() else _default_user_id()
+    payload = _calendar_event_payload(resolved_user_id, event, source)
+
+    try:
+        interaction_store.client.table("calendar_events").upsert(
+            payload,
+            on_conflict="user_id,google_event_id",
+        ).execute()
+        print(
+            f"[SUPABASE] Calendar event synced user_id={resolved_user_id} "
+            f"event_id={payload.get('google_event_id')} source={source}"
+        )
+        return True
+    except Exception as exc:
+        print(f"[SUPABASE] Failed syncing calendar event: {exc}")
+        return False
+
+
+def sync_calendar_events_sync(
+    user_id: str | None,
+    events: list[dict[str, Any]],
+    source: str = "google_calendar_detected",
+) -> int:
+    """Bulk sync calendar events into Supabase table `calendar_events`."""
+    if not interaction_store.enabled or interaction_store.client is None:
+        return 0
+    if not events:
+        return 0
+
+    resolved_user_id = user_id.strip() if user_id and user_id.strip() else _default_user_id()
+    payloads = [_calendar_event_payload(resolved_user_id, event, source) for event in events]
+
+    try:
+        interaction_store.client.table("calendar_events").upsert(
+            payloads,
+            on_conflict="user_id,google_event_id",
+        ).execute()
+        print(
+            f"[SUPABASE] Synced {len(payloads)} calendar events "
+            f"for user_id={resolved_user_id} source={source}"
+        )
+        return len(payloads)
+    except Exception as exc:
+        print(f"[SUPABASE] Failed bulk syncing calendar events: {exc}")
+        return 0
