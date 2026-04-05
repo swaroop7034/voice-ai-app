@@ -6,6 +6,7 @@ from typing import Any, Awaitable, Callable
 
 import ollama
 from integrations.supabase_store import get_default_user_id
+from logger import logger, log_error
 
 
 async def classify_memory(user_text: str, aries_text: str) -> dict[str, Any]:
@@ -47,14 +48,16 @@ Keep topic as single word or two words max."""
             normalized_type = str(result.get("type", "HISTORY")).upper().strip()
             result["type"] = normalized_type if normalized_type in {"FACT", "PREFERENCE", "HISTORY"} else "HISTORY"
             result["topic"] = str(result.get("topic", "general")).strip().lower() or "general"
-            print(f"[CLASSIFIER] Detected memory_type={result['type']} topic={result['topic']} confidence={result.get('confidence', 0.0)}")
+            logger.debug(
+                f"[CLASSIFIER] Detected memory_type={result['type']} topic={result['topic']} confidence={result.get('confidence', 0.0)}"
+            )
             return result
 
-        print(f"[CLASSIFIER] Could not parse JSON from: {output_text}")
+        logger.debug(f"[CLASSIFIER] Could not parse JSON from: {output_text}")
         return {"type": "HISTORY", "topic": "general", "confidence": 0.5}
 
     except Exception as e:
-        print(f"[CLASSIFIER ERROR] {e}")
+        log_error(f"Classifier error: {e}")
         return {"type": "HISTORY", "topic": "general", "confidence": 0.0}
 
 
@@ -84,7 +87,7 @@ async def classify_and_store_background(
         metadata = await classify_memory(user_text, aries_text)
         importance = get_importance_score(metadata.get("type", "HISTORY"))
 
-        print(
+        logger.debug(
             f"[PERSONALIZATION] user_id={resolved_user_id} "
             f"memory_type={metadata.get('type')} topic={metadata.get('topic')} importance={importance:.2f}"
         )
@@ -105,4 +108,4 @@ async def classify_and_store_background(
             )
 
     except Exception as e:
-        print(f"[MEMORY CLASSIFIER] Background task failed: {e}")
+        log_error(f"Memory classifier background task failed: {e}")

@@ -5,6 +5,8 @@ export const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_
 export type SafeFolderAccessResponse = {
   status?: string;
   message?: string;
+  aries_text?: string;
+  audio?: string;
   access_granted?: boolean;
   reason?: 'keyword_mismatch' | 'voice_mismatch' | 'stt_failed' | 'supabase_read_failed' | string;
   score?: number;

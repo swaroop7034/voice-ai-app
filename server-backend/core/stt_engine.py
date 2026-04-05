@@ -1,6 +1,8 @@
 import os
 import torch
 
+from logger import logger, log_error
+
 # ─── VRAM-AWARE MODEL SELECTION ────────────────────────────────
 # Using faster-whisper with int8 quantization:
 #   medium  int8 → ~1.2GB VRAM  ← your sweet spot (4GB VRAM, Llama sharing)
@@ -12,15 +14,15 @@ import torch
 DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
 COMPUTE_TYPE = "int8_float16" if DEVICE == "cuda" else "int8"
 
-print(f"[STT] Loading faster-whisper medium ({COMPUTE_TYPE}) on {DEVICE}...")
+logger.info(f"[STT] Loading faster-whisper medium ({COMPUTE_TYPE}) on {DEVICE}...")
 
 try:
     from faster_whisper import WhisperModel
     model = WhisperModel("medium", device=DEVICE, compute_type=COMPUTE_TYPE)
     USE_FASTER_WHISPER = True
-    print("[STT] faster-whisper ready.")
+    logger.info("[STT] faster-whisper ready.")
 except ImportError:
-    print("[STT] faster-whisper not found — falling back to openai-whisper small.")
+    logger.info("[STT] faster-whisper not found — falling back to openai-whisper small.")
     import whisper
     model = whisper.load_model("small", device=DEVICE)
     USE_FASTER_WHISPER = False
@@ -48,7 +50,7 @@ def speech_to_text(audio_path: str) -> str | None:
         else:
             return _transcribe_openai(audio_path)
     except Exception as e:
-        print(f"[STT Error] {e}")
+        log_error(f"STT error: {e}")
         return None
 
 
@@ -72,9 +74,9 @@ def _transcribe_faster(audio_path: str) -> str | None:
     )
     text = " ".join(seg.text.strip() for seg in segments).strip()
     if not text or text.lower() in HALLUCINATION_PHRASES or len(text) < 2:
-        print(f"[STT] Filtered: '{text}'")
+        logger.debug(f"[STT] Filtered: '{text}'")
         return None
-    print(f"[STT] Transcribed: {text}")
+    logger.debug(f"[STT] Transcribed: {text}")
     return text
 
 
@@ -91,7 +93,7 @@ def _transcribe_openai(audio_path: str) -> str | None:
     )
     text = result["text"].strip()
     if not text or text.lower() in HALLUCINATION_PHRASES or len(text) < 2:
-        print(f"[STT] Filtered: '{text}'")
+        logger.debug(f"[STT] Filtered: '{text}'")
         return None
-    print(f"[STT] Transcribed: {text}")
+    logger.debug(f"[STT] Transcribed: {text}")
     return text

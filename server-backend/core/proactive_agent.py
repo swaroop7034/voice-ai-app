@@ -11,6 +11,7 @@ from core.behavior_analyzer import (
     mark_suggestions_seen,
 )
 from integrations.supabase_store import get_default_user_id
+from logger import log_debug, log_error, log_step
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -26,7 +27,7 @@ def _run_behavior_suggestion_cycle(now: datetime) -> None:
 
         unseen = await fetch_unseen_suggestions(user_id, limit=1)
         if not unseen:
-            print(f"[PROACTIVE] No behavior suggestion to send at {now.strftime('%H:%M')}")
+            log_debug(f"[PROACTIVE] No behavior suggestion to send at {now.strftime('%H:%M')}")
             return
 
         item = unseen[0]
@@ -48,16 +49,16 @@ def _run_behavior_suggestion_cycle(now: datetime) -> None:
                 "user_id": user_id,
             }
         )
-        print(f"[PROACTIVE] Queued behavior suggestion for {user_id} at {now.strftime('%H:%M')}")
+        log_step("PROACTIVE_SUGGESTION_QUEUED")
 
     try:
         asyncio.run(_generate_once())
     except Exception as exc:
-        print(f"[PROACTIVE ERROR] Behavior suggestion cycle failed: {exc}")
+        log_error(f"PROACTIVE behavior suggestion cycle failed: {exc}")
 
 
 def monitor_schedule():
-    print("[PROACTIVE] Aries is monitoring your schedule, Sir.")
+    log_step("PROACTIVE_MONITOR_STARTED")
 
     alert_history = {}
     daily_suggestion_history: set[str] = set()
@@ -113,7 +114,7 @@ def monitor_schedule():
                             else:
                                 time_msg = f"starts in {mins} minutes"
 
-                            print(f"\n[PROACTIVE ALERT]: {event_name} {time_msg}")
+                            log_step("PROACTIVE_ALERT_QUEUED")
 
                             # Push the whole event — main.py passes it to brain.handle_alert_event()
                             alert_queue.append(event)
@@ -132,5 +133,5 @@ def monitor_schedule():
             time.sleep(60)
 
         except Exception as e:
-            print(f"[PROACTIVE ERROR] {e}")
+            log_error(f"PROACTIVE error: {e}")
             time.sleep(30)

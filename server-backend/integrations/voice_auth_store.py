@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from supabase import Client, create_client
 
 from integrations.supabase_store import get_default_user_id
+from logger import logger, log_error
 
 load_dotenv()
 
@@ -29,7 +30,7 @@ def get_supabase_client() -> Client | None:
     try:
         return create_client(SUPABASE_URL, SUPABASE_KEY)
     except Exception as exc:
-        print(f"[VOICE_AUTH] Supabase client init failed: {exc}")
+        log_error(f"VOICE_AUTH Supabase client init failed: {exc}")
         return None
 
 
@@ -107,9 +108,51 @@ def save_embedding_to_supabase(user_id: str, embedding: np.ndarray) -> dict[str,
             "message": "Voice embedding stored successfully",
         }
     except Exception as exc:
-        print(f"[VOICE_AUTH] Failed to store embedding for user_id={resolved_user_id}: {exc}")
+        log_error(f"VOICE_AUTH failed to store embedding for user_id={resolved_user_id}: {exc}")
         return {
             "success": False,
             "reason": "supabase_write_failed",
             "message": "Failed to store voice embedding",
+        }
+
+
+def delete_embedding_from_supabase(user_id: str) -> dict[str, object]:
+    client = get_supabase_client()
+    if client is None:
+        return {
+            "success": False,
+            "reason": "supabase_not_configured",
+            "message": "Supabase client is not configured",
+        }
+
+    resolved_user_id = (user_id or "").strip() or get_default_user_id()
+
+    try:
+        existing_response = (
+            client.table(VOICE_AUTH_TABLE)
+            .select("user_id")
+            .eq("user_id", resolved_user_id)
+            .limit(1)
+            .execute()
+        )
+        existing_rows = list(getattr(existing_response, "data", []) or [])
+        if not existing_rows:
+            return {
+                "success": True,
+                "reason": "not_found",
+                "message": "No existing voice data found",
+            }
+
+        client.table(VOICE_AUTH_TABLE).delete().eq("user_id", resolved_user_id).execute()
+        return {
+            "success": True,
+            "reason": "ok",
+            "message": "Voice data deleted successfully",
+        }
+    except Exception as exc:
+        log_error(f"VOICE_AUTH failed to delete embedding for user_id={resolved_user_id}: {exc}")
+        return {
+            "success": False,
+            "reason": "supabase_delete_failed",
+            "message": "Failed to delete voice embedding",
         }

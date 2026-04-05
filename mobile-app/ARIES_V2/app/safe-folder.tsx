@@ -31,6 +31,10 @@ export default function SafeFolderAccessScreen() {
     };
   }, []);
 
+  const showResultAlert = (title: string, message: string) => {
+    Alert.alert(title, message);
+  };
+
   const startRecording = async () => {
     try {
       const permission = await Audio.requestPermissionsAsync();
@@ -79,8 +83,10 @@ export default function SafeFolderAccessScreen() {
       });
       console.log('[SafeFolder] Backend response:', response);
 
+      const assistantText = response.aries_text || response.message || '';
+
       if (response.status === 'enrolled') {
-        Alert.alert('Success', 'Voice registered successfully');
+        showResultAlert('Success', 'Voice registered successfully');
         setLastMessage('Voice registered successfully');
         setState('idle');
         return;
@@ -93,7 +99,8 @@ export default function SafeFolderAccessScreen() {
       }
 
       const errorMessage =
-        response.message
+        assistantText
+          || response.message
           || (response.reason === 'keyword_mismatch'
             ? 'Wrong keyword'
             : response.reason === 'voice_mismatch'
@@ -105,7 +112,7 @@ export default function SafeFolderAccessScreen() {
                   : 'Access denied');
 
       setLastMessage(errorMessage);
-      Alert.alert('Access denied', errorMessage);
+  showResultAlert('Access Denied', errorMessage);
       setState('idle');
     } catch (error) {
       console.error('[SafeFolder] Submission failed', error);

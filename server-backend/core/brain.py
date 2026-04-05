@@ -26,6 +26,7 @@ from tools.calendar_module import (
 )
 import core.state as state
 from integrations.supabase_store import build_memory_context, get_default_user_id, log_interaction, search_similar
+from logger import logger, log_error, log_step
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -171,7 +172,7 @@ async def classify_intent_with_llm(text: str) -> str:
             return label
         return "general"
     except Exception as exc:
-        print(f"[INTENT] LLM fallback failed: {exc}")
+        log_error(f"INTENT LLM fallback failed: {exc}")
         return "general"
 
 
@@ -210,8 +211,6 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
     resolved_user_id = user_id or get_default_user_id()
     user_text = clean_stt_shorthand(user_text)
     text = user_text.lower().strip()
-
-    print(f"[QUERY] user_id={resolved_user_id} text={user_text}")
 
     if not text:
         return "I am standing by, Sir."
@@ -313,7 +312,7 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
     if force_schedule_intent:
         intent = "schedule"
         intent_source = "context"
-    print(f"[INTENT] source={intent_source} final_intent={intent} text={text}")
+    logger.debug(f"[INTENT] source={intent_source} final_intent={intent} text={text}")
 
     # ══════════════════════════════════════════
     #  STEP 4 — STANDALONE RESCHEDULE INTENT
@@ -496,7 +495,7 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
             return "The calendar uplink failed, Sir."
 
         except Exception as e:
-            print(f"Scheduling Error: {e}")
+            log_error(f"Scheduling error: {e}")
             # Do not exit scheduling mode on parser/runtime issues.
             fallback_title = PENDING_DATA.get("title", "Meeting")
             fallback_day = PENDING_DATA.get("day", "today")
@@ -554,6 +553,9 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
         behavior_task,
     )
 
+    log_step("USER_FETCH_COMPLETED")
+    log_step("VECTOR_SEARCH_COMPLETED")
+
     decayed_memories = apply_memory_decay(retrieved_memories)
     memory_candidates, preference_memories = filter_memories_by_type(decayed_memories)
     selected_memories = smart_memory_selector(memory_candidates, max_memory=MAX_MEMORY)
@@ -574,12 +576,7 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
     if preference_context:
         profile_context = f"{profile_context}\n\n## Preference memories:\n{preference_context}".strip()
 
-    print(
-        f"[INTELLIGENCE] memories_retrieved={len(retrieved_memories)} "
-        f"memories_used={len(selected_memories)} history_used={len(recent_history[-MAX_HISTORY:])}"
-    )
-    print(f"[INTELLIGENCE] compressed_context={compressed_points}")
-    print(f"[INTELLIGENCE] behavior_context={behavior_context}")
+    log_step("CONTEXT_BUILD_COMPLETED")
 
     response = await get_aries_response(
         user_text,

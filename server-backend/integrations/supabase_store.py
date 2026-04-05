@@ -13,6 +13,8 @@ import ollama
 from dotenv import load_dotenv
 from supabase import Client, create_client
 
+from logger import logger
+
 load_dotenv()
 
 DEFAULT_TABLE_NAME = "inetartction"
@@ -20,6 +22,26 @@ DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
 DEFAULT_SIMILARITY_THRESHOLD = 0.55
 DEFAULT_MEMORY_LIMIT = 5
 DEFAULT_MEMORY_CHAR_LIMIT = 1200
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+SUPABASE_VERBOSE = _env_bool("SUPABASE_VERBOSE", default=False)
+
+
+def _supabase_log(message: str) -> None:
+    if SUPABASE_VERBOSE:
+        logger.debug(message)
+        return
+
+    upper_message = message.upper()
+    if "FAILED" in upper_message or "ERROR" in upper_message or "EXCEPTION" in upper_message:
+        logger.error(message)
 
 
 def _env(name: str, default: str = "") -> str:
@@ -56,7 +78,7 @@ def _default_user_id() -> str:
         if resolved_user_id:
             return resolved_user_id
     except Exception as exc:
-        print(f"[SUPABASE] Failed to resolve Gmail user id: {exc}")
+        _supabase_log(f"[SUPABASE] Failed to resolve Gmail user id: {exc}")
 
     return "anonymous"
 
@@ -122,10 +144,10 @@ class SupabaseInteractionStore:
         try:
             response = ollama.embeddings(model=self.embedding_model, prompt=cleaned_text)
             embedding = list(response.embedding)
-            print(f"[SUPABASE] Embedding length: {len(embedding)}")
+            _supabase_log(f"[SUPABASE] Embedding length: {len(embedding)}")
             return embedding
         except Exception as exc:
-            print(f"[SUPABASE] Embedding generation failed: {exc}")
+            _supabase_log(f"[SUPABASE] Embedding generation failed: {exc}")
             return None
 
     async def _embed_query(self, text: str) -> list[float] | None:
@@ -138,7 +160,7 @@ class SupabaseInteractionStore:
         def _execute() -> list[dict[str, Any]]:
             response = self.client.rpc("match_memory", params).execute()
             rows = list(response.data or [])
-            print(f"[SUPABASE] RPC response rows: {rows}")
+            _supabase_log(f"[SUPABASE] RPC response rows: {rows}")
             return rows
 
         return await asyncio.to_thread(_execute)
@@ -218,14 +240,14 @@ class SupabaseInteractionStore:
         threshold: float = 0.75,
     ) -> list[dict[str, Any]]:
         if not self.enabled or self.client is None:
-            print("[SUPABASE] Skipping vector search because Supabase is not configured.")
+            _supabase_log("[SUPABASE] Skipping vector search because Supabase is not configured.")
             return []
 
         resolved_user_id = user_id.strip() if user_id and user_id.strip() else _default_user_id()
-        print(f"[SUPABASE] Searching memory for user_id={resolved_user_id}")
+        _supabase_log(f"[SUPABASE] Searching memory for user_id={resolved_user_id}")
         query_embedding = await self._embed_query(query)
         if not query_embedding:
-            print("[SUPABASE] Query embedding generation returned None.")
+            _supabase_log("[SUPABASE] Query embedding generation returned None.")
             return []
 
         try:
@@ -237,7 +259,7 @@ class SupabaseInteractionStore:
                 }
             )
         except Exception as exc:
-            print(f"[SUPABASE] vector search RPC failed: {exc}")
+            _supabase_log(f"[SUPABASE] vector search RPC failed: {exc}")
             return []
 
         memories = [self._row_to_memory(row) for row in raw_rows]
@@ -245,12 +267,12 @@ class SupabaseInteractionStore:
         memories.sort(key=lambda item: item.get("score", item["similarity"]), reverse=True)
 
         if not memories:
-            print(f"[SUPABASE] No vector memories returned for user {resolved_user_id}; falling back to keyword search.")
+            _supabase_log(f"[SUPABASE] No vector memories returned for user {resolved_user_id}; falling back to keyword search.")
             memories = await self._keyword_search(query=query, user_id=resolved_user_id, limit=limit)
 
-        print(f"[SUPABASE] Retrieved {len(memories)} memory candidates for user {resolved_user_id}")
+        _supabase_log(f"[SUPABASE] Retrieved {len(memories)} memory candidates for user {resolved_user_id}")
         for index, memory in enumerate(memories, start=1):
-            print(
+            _supabase_log(
                 f"[SUPABASE] Match {index}: similarity={memory.get('similarity', 0.0):.4f} | "
                 f"score={memory.get('score', 0.0):.4f} | user_id={resolved_user_id} | "
                 f"User={memory['user_text']} | AI={memory['aries_text']}"
@@ -273,7 +295,7 @@ class SupabaseInteractionStore:
         )
         context = self._format_memory_block(similar_memories)
         if context:
-            print(f"[SUPABASE] Memory context injected:\n{context}")
+            _supabase_log(f"[SUPABASE] Memory context injected ({len(similar_memories)} item(s))")
         return context
 
     async def get_recent_interactions(self, user_id: str | None, limit: int = 7) -> list[dict[str, Any]]:
@@ -296,10 +318,10 @@ class SupabaseInteractionStore:
 
         try:
             rows = await asyncio.to_thread(_execute)
-            print(f"[SUPABASE] Loaded {len(rows)} recent interactions for user_id={resolved_user_id}")
+            _supabase_log(f"[SUPABASE] Loaded {len(rows)} recent interactions for user_id={resolved_user_id}")
             return rows
         except Exception as exc:
-            print(f"[SUPABASE] Failed loading recent interactions for {resolved_user_id}: {exc}")
+            _supabase_log(f"[SUPABASE] Failed loading recent interactions for {resolved_user_id}: {exc}")
             return []
 
     async def _is_duplicate(self, user_id: str, user_text: str, aries_text: str) -> bool:
@@ -319,7 +341,7 @@ class SupabaseInteractionStore:
                 self._normalize_text(memory.get("user_text", "")) == normalized_user_text
                 and self._normalize_text(memory.get("aries_text", "")) == normalized_aries_text
             ):
-                print(f"[SUPABASE] Duplicate memory skipped for user {user_id}")
+                _supabase_log(f"[SUPABASE] Duplicate memory skipped for user {user_id}")
                 return True
 
         return False
@@ -333,11 +355,11 @@ class SupabaseInteractionStore:
         importance: float = 0.5,
     ) -> None:
         if not self.enabled or self.client is None:
-            print("[SUPABASE] Skipping interaction log because Supabase is not configured.")
+            _supabase_log("[SUPABASE] Skipping interaction log because Supabase is not configured.")
             return
 
         resolved_user_id = user_id.strip() if user_id and user_id.strip() else _default_user_id()
-        print(f"[SUPABASE] Logging interaction for user_id={resolved_user_id}")
+        _supabase_log(f"[SUPABASE] Logging interaction for user_id={resolved_user_id}")
 
         if await self._is_duplicate(resolved_user_id, user_text, aries_text):
             return
@@ -345,11 +367,11 @@ class SupabaseInteractionStore:
         embedding_source = f"User: {user_text}\nAI: {aries_text}".strip()
         embedding = await self._embed_query(embedding_source)
         if embedding is None:
-            print("[SUPABASE] Embedding is None, retrying once before insert.")
+            _supabase_log("[SUPABASE] Embedding is None, retrying once before insert.")
             embedding = await self._embed_query(embedding_source)
 
         if embedding is None:
-            print("[SUPABASE] Skipping insert because embedding generation failed twice.")
+            _supabase_log("[SUPABASE] Skipping insert because embedding generation failed twice.")
             return
 
         payload: dict[str, Any] = {
@@ -363,9 +385,9 @@ class SupabaseInteractionStore:
 
         try:
             await asyncio.to_thread(lambda: self.client.table(self.table_name).insert(payload).execute())
-            print(f"[SUPABASE] Stored interaction for {resolved_user_id} (type={metadata.get('type') if metadata else 'UNKNOWN'}, importance={importance:.2f})")
+            _supabase_log(f"[SUPABASE] Stored interaction for {resolved_user_id} (type={metadata.get('type') if metadata else 'UNKNOWN'}, importance={importance:.2f})")
         except Exception as exc:
-            print(f"[SUPABASE] Failed to store interaction: {exc}")
+            _supabase_log(f"[SUPABASE] Failed to store interaction: {exc}")
 
 
 interaction_store = SupabaseInteractionStore()
@@ -469,13 +491,13 @@ def upsert_calendar_event_sync(user_id: str | None, event: dict[str, Any], sourc
             payload,
             on_conflict="user_id,google_event_id",
         ).execute()
-        print(
+        _supabase_log(
             f"[SUPABASE] Calendar event synced user_id={resolved_user_id} "
             f"event_id={payload.get('google_event_id')} source={source}"
         )
         return True
     except Exception as exc:
-        print(f"[SUPABASE] Failed syncing calendar event: {exc}")
+        _supabase_log(f"[SUPABASE] Failed syncing calendar event: {exc}")
         return False
 
 
@@ -498,11 +520,11 @@ def sync_calendar_events_sync(
             payloads,
             on_conflict="user_id,google_event_id",
         ).execute()
-        print(
+        _supabase_log(
             f"[SUPABASE] Synced {len(payloads)} calendar events "
             f"for user_id={resolved_user_id} source={source}"
         )
         return len(payloads)
     except Exception as exc:
-        print(f"[SUPABASE] Failed bulk syncing calendar events: {exc}")
+        _supabase_log(f"[SUPABASE] Failed bulk syncing calendar events: {exc}")
         return 0

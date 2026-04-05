@@ -9,6 +9,7 @@ from supabase import Client, create_client
 from dotenv import load_dotenv
 import os
 from core.intelligence_layer import conflict_resolver
+from logger import log_error, log_step
 
 load_dotenv()
 
@@ -56,7 +57,6 @@ class UserProfileManager:
                 return profile
 
             # No row exists yet for first-time users; create one once to avoid repeated misses.
-            print(f"[PROFILE] No profile exists yet for {user_id}; creating default profile.")
             await self._update_profile_db(
                 user_id=user_id,
                 facts={},
@@ -64,7 +64,7 @@ class UserProfileManager:
             )
             return self._default_profile(user_id)
         except Exception as e:
-            print(f"[PROFILE] Failed to fetch profile for {user_id}: {e}")
+            log_error(f"Profile fetch failed for {user_id}: {e}")
             return self._default_profile(user_id)
 
     async def update_profile_from_memory(
@@ -87,7 +87,7 @@ class UserProfileManager:
 
             if memory_type == "FACT":
                 facts[topic] = user_text
-                print(f"[PROFILE] Updated FACT: {topic} -> {user_text[:50]}")
+                log_step("PROFILE_UPDATED")
 
             elif memory_type == "PREFERENCE":
                 pref_key, pref_value = self._extract_preference(topic, user_text)
@@ -95,8 +95,8 @@ class UserProfileManager:
                 preferences["latest_response_style"] = pref_value if pref_key == "response_style" else preferences.get("latest_response_style", "")
                 preferences, resolved_notes = conflict_resolver(preferences)
                 if resolved_notes:
-                    print(f"[PROFILE] Conflicts resolved for {user_id}: {', '.join(resolved_notes)}")
-                print(f"[PROFILE] Updated PREFERENCE: {topic} -> {user_text[:50]}")
+                    log_step("PROFILE_CONFLICTS_RESOLVED")
+                log_step("PROFILE_UPDATED")
 
             await self._update_profile_db(
                 user_id=user_id,
@@ -104,7 +104,7 @@ class UserProfileManager:
                 preferences=preferences,
             )
         except Exception as e:
-            print(f"[PROFILE] Failed to update profile: {e}")
+            log_error(f"Profile update failed: {e}")
 
     def _extract_preference(self, topic: str, user_text: str) -> tuple[str, str]:
         """Normalize known preference styles for consistent profile dominance."""
@@ -134,9 +134,9 @@ class UserProfileManager:
                 }).execute()
 
             await asyncio.to_thread(_upsert)
-            print(f"[PROFILE] Saved profile for {user_id}")
+            log_step("PROFILE_SAVE_COMPLETED")
         except Exception as e:
-            print(f"[PROFILE] Failed to save profile: {e}")
+            log_error(f"Profile save failed: {e}")
 
     def _default_profile(self, user_id: str = "anonymous") -> dict[str, Any]:
         """Return default profile structure."""

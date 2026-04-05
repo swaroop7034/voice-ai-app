@@ -3,6 +3,7 @@ from datetime import datetime
 
 import ollama
 from integrations.supabase_store import get_recent_interactions
+from logger import log_debug, log_error, log_step
 
 CHAT_HISTORY_LIMIT = 14
 MAX_HISTORY = 5
@@ -50,7 +51,9 @@ async def get_recent_chat_history(user_id: str | None, limit: int = CHAT_HISTORY
             existing = chat_history.get(resolved_user_id, [])
             if not existing and hydrated:
                 chat_history[resolved_user_id] = hydrated
-                print(f"[LOCAL AI] Hydrated in-memory chat history from Supabase for user_id={resolved_user_id}, messages={len(hydrated)}")
+                log_debug(
+                    f"[LOCAL AI] Hydrated in-memory chat history from Supabase for user_id={resolved_user_id}, messages={len(hydrated)}"
+                )
             history = chat_history.get(resolved_user_id, [])
             return [message.copy() for message in history[-limit:]]
 
@@ -142,21 +145,6 @@ def _build_system_prompt(
     }
 
 
-def _format_prompt_preview(messages_to_send: list[dict[str, str]], limit: int = 2000) -> str:
-    parts: list[str] = []
-    for message in messages_to_send:
-        role = message.get('role', 'unknown').upper()
-        content = (message.get('content') or '').strip()
-        if not content:
-            continue
-        parts.append(f"[{role}] {content}")
-
-    preview = "\n".join(parts)
-    if len(preview) > limit:
-        return preview[:limit] + "... [truncated]"
-    return preview
-
-
 async def get_aries_response(
     user_text: str,
     user_id: str | None = None,
@@ -171,7 +159,6 @@ async def get_aries_response(
     """
     try:
         resolved_user_id = _resolve_user_key(user_id)
-        print(f"[LOCAL AI] Inference started for user_id={resolved_user_id}: {user_text}")
 
         today_date = datetime.now().strftime("%B %d, %Y")
 
@@ -194,9 +181,7 @@ async def get_aries_response(
         )
         messages_to_send = [system_prompt, {'role': 'user', 'content': user_text}]
 
-        prompt_preview = _format_prompt_preview(messages_to_send)
-        print(f"[LOCAL AI] Final prompt length={len(prompt_preview)} chars for user_id={resolved_user_id}")
-        print(f"[LOCAL AI] Final prompt for user_id={resolved_user_id}:\n{prompt_preview}")
+        log_step("PROMPT_SENT_TO_LLM")
 
         response = await asyncio.to_thread(
             ollama.chat,
@@ -205,11 +190,11 @@ async def get_aries_response(
         )
 
         ai_message = response['message']['content']
+        log_step("LLM_RESPONSE_RECEIVED")
         await append_chat_message(resolved_user_id, 'assistant', ai_message)
 
-        print(f"[LOCAL AI] Response generated for user_id={resolved_user_id}.")
         return ai_message
 
     except Exception as e:
-        print(f"[LOCAL AI ERROR] Connection to Ollama failed: {e}")
+        log_error(f"Local AI connection to Ollama failed: {e}")
         return "My memory banks are currently inaccessible, Sir. Please check the local engine."

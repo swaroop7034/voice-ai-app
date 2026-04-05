@@ -12,6 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from logger import log_debug, log_error
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -34,13 +36,13 @@ def _play_audio_file(path: str) -> bool:
     try:
         if os.name == "nt":
             os.startfile(path)  # type: ignore[attr-defined]
-            print(f"[VOICE TEST] Playing audio: {path}")
+            log_debug(f"[VOICE TEST] Playing audio: {path}")
             return True
 
-        print(f"[VOICE TEST] Auto-play not supported on this OS. Audio saved at: {path}")
+        log_debug(f"[VOICE TEST] Auto-play not supported on this OS. Audio saved at: {path}")
         return False
     except Exception as exc:
-        print(f"[VOICE TEST] Failed to play audio file: {exc}")
+        log_error(f"VOICE TEST failed to play audio file: {exc}")
         return False
 
 
@@ -71,7 +73,7 @@ async def _fetch_recent_rows(user_id: str, rows: int) -> list[dict[str, Any]]:
     try:
         return await asyncio.to_thread(_execute)
     except Exception as exc:
-        print(f"[VOICE TEST] Failed to fetch interactions: {exc}")
+        log_error(f"VOICE TEST failed to fetch interactions: {exc}")
         return []
 
 
@@ -152,7 +154,7 @@ async def run(user_id: str | None, rows: int, output_path: str) -> None:
 
     interactions = await _fetch_recent_rows(resolved_user_id, rows)
     if not interactions:
-        print("[VOICE TEST] No interactions found for suggestion generation.")
+        log_debug("[VOICE TEST] No interactions found for suggestion generation.")
         return
 
     patterns = await _build_patterns_from_rows(resolved_user_id, interactions)
@@ -171,7 +173,7 @@ async def run(user_id: str | None, rows: int, output_path: str) -> None:
         "audio_played": bool(played),
         "patterns": patterns,
     }
-    print(json.dumps(payload, indent=2, default=str))
+    log_debug(json.dumps(payload, indent=2, default=str))
 
 
 def parse_args() -> argparse.Namespace:

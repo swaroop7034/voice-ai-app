@@ -10,6 +10,7 @@ from typing import Any
 
 import ollama
 from integrations.supabase_store import get_default_user_id, interaction_store
+from logger import log_error, log_step
 
 _PATTERN_COUNTER: dict[str, int] = defaultdict(int)
 PATTERN_INTERVAL = 5
@@ -143,7 +144,7 @@ async def _extract_topics_phi3(texts: list[str]) -> list[str]:
     try:
         return await asyncio.to_thread(_extract_topics_phi3_sync, texts)
     except Exception as exc:
-        print(f"[BEHAVIOR] phi3 topic extraction failed: {exc}")
+        log_error(f"BEHAVIOR topic extraction failed: {exc}")
         return ["unknown"] * len(texts)
 
 
@@ -165,7 +166,7 @@ async def _fetch_recent_interactions(user_id: str, limit: int = 60) -> list[dict
     try:
         return await asyncio.to_thread(_execute)
     except Exception as exc:
-        print(f"[BEHAVIOR] Failed to fetch interactions for {user_id}: {exc}")
+        log_error(f"BEHAVIOR failed to fetch interactions for {user_id}: {exc}")
         return []
 
 
@@ -332,7 +333,7 @@ async def analyze_patterns(user_id: str | None) -> list[dict[str, Any]]:
     final_insights = [ins for ins in insights if float(ins.get("confidence") or 0.0) >= MIN_INSIGHT_CONFIDENCE]
     final_insights.sort(key=lambda item: float(item.get("confidence") or 0.0), reverse=True)
 
-    print(f"[BEHAVIOR] Insights detected for {resolved_user_id}: {final_insights}")
+    log_step("BEHAVIOR_ANALYSIS_COMPLETED")
     return final_insights
 
 
@@ -350,7 +351,7 @@ async def store_patterns(user_id: str | None, patterns: list[dict[str, Any]]) ->
     try:
         await asyncio.to_thread(_execute)
     except Exception as exc:
-        print(f"[BEHAVIOR] Failed storing patterns for {resolved_user_id}: {exc}")
+        log_error(f"BEHAVIOR failed storing patterns for {resolved_user_id}: {exc}")
 
 
 async def _load_patterns(user_id: str) -> list[dict[str, Any]]:
@@ -371,7 +372,7 @@ async def _load_patterns(user_id: str) -> list[dict[str, Any]]:
     try:
         return await asyncio.to_thread(_execute)
     except Exception as exc:
-        print(f"[BEHAVIOR] Failed loading patterns for {user_id}: {exc}")
+        log_error(f"BEHAVIOR failed loading patterns for {user_id}: {exc}")
         return []
 
 
@@ -426,7 +427,6 @@ def predict_next_action(user_insights: list[dict[str, Any]]) -> list[dict[str, A
             )
 
     predictions.sort(key=lambda p: float(p.get("priority") or 0.0), reverse=True)
-    print(f"[BEHAVIOR] Predicted next actions: {predictions}")
     return predictions
 
 
@@ -512,11 +512,6 @@ async def generate_suggestions(user_id: str | None) -> list[dict[str, Any]]:
                 reason = str(prediction.get("action") or "")
                 break
 
-        print(
-            f"[BEHAVIOR] Suggestion reasoning user_id={resolved_user_id} "
-            f"type={ptype} confidence={confidence:.3f} reason={reason or 'pattern-derived'}"
-        )
-
         suggestions_to_insert.append(
             {
                 "user_id": resolved_user_id,
@@ -539,10 +534,10 @@ async def generate_suggestions(user_id: str | None) -> list[dict[str, Any]]:
 
     try:
         inserted = await asyncio.to_thread(_insert)
-        print(f"[BEHAVIOR] Generated suggestions for {resolved_user_id}: {inserted}")
+        log_step("BEHAVIOR_SUGGESTIONS_COMPLETED")
         return inserted
     except Exception as exc:
-        print(f"[BEHAVIOR] Failed storing suggestions for {resolved_user_id}: {exc}")
+        log_error(f"BEHAVIOR failed storing suggestions for {resolved_user_id}: {exc}")
         return []
 
 
@@ -585,9 +580,7 @@ async def build_behavior_context(user_id: str | None, limit: int = 3) -> str:
         if action:
             lines.append(f"* Predicted next need: {action}")
 
-    context = "\n".join(lines)
-    print(f"[BEHAVIOR] Prompt behavior context for {resolved_user_id}: {context}")
-    return context
+    return "\n".join(lines)
 
 
 async def fetch_unseen_suggestions(user_id: str | None, limit: int = MAX_SUGGESTIONS) -> list[dict[str, Any]]:
@@ -611,7 +604,7 @@ async def fetch_unseen_suggestions(user_id: str | None, limit: int = MAX_SUGGEST
         rows = await asyncio.to_thread(_execute)
         return rows
     except Exception as exc:
-        print(f"[BEHAVIOR] Failed fetching unseen suggestions for {resolved_user_id}: {exc}")
+        log_error(f"BEHAVIOR failed fetching unseen suggestions for {resolved_user_id}: {exc}")
         return []
 
 
@@ -626,6 +619,5 @@ async def mark_suggestions_seen(suggestion_ids: list[int]) -> None:
 
     try:
         await asyncio.to_thread(_execute)
-        print(f"[BEHAVIOR] Delivered suggestions marked seen: {suggestion_ids}")
     except Exception as exc:
-        print(f"[BEHAVIOR] Failed marking suggestions seen: {exc}")
+        log_error(f"BEHAVIOR failed marking suggestions seen: {exc}")

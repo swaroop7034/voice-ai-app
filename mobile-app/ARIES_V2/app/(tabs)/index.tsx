@@ -17,7 +17,7 @@ import { useRouter } from "expo-router";
 
 const { width } = Dimensions.get("window");
 
-const BASE_URL  = "http://10.46.26.175:8000";
+const BASE_URL  = "http://192.168.1.4:8000";
 const CHAT_URL  = `${BASE_URL}/chat`;
 const ALERT_URL = `${BASE_URL}/check-alerts`;
 
@@ -172,6 +172,10 @@ export default function HomeScreen() {
   const playVoiceResponse = useCallback(async (base64Audio: string) => {
     try {
       setIsSpeaking(true);
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: false,
+        playsInSilentModeIOS: true,
+      });
       const { sound } = await Audio.Sound.createAsync(
         { uri: `data:audio/mp3;base64,${base64Audio.replace(/\s/g, "")}` },
         { shouldPlay: true, volume: 1.0 }
@@ -202,15 +206,15 @@ export default function HomeScreen() {
         body: JSON.stringify({ text }),
       });
       const data = await res.json();
-      if (data.status === "success") {
-        setChatHistory(prev => [
-          ...prev,
-          { role: "USER",  content: text },
-          { role: "ARIES", content: data.aries_text || "..." },
-        ]);
-        setSlotOptions([]);
-        if (data.audio) await playVoiceResponse(data.audio);
-      }
+      const assistantText = String(data.aries_text || data.message || "...");
+      setChatHistory(prev => [
+        ...prev,
+        { role: "USER",  content: text },
+        { role: "ARIES", content: assistantText },
+      ]);
+      setSlotOptions([]);
+      if (data.audio) await playVoiceResponse(data.audio);
+      else if (data.status !== "success") setStatus("IDLE");
     } catch (_) { setStatus("IDLE"); }
   }, [playVoiceResponse]);
 
@@ -299,8 +303,20 @@ export default function HomeScreen() {
         return;
       }
 
+      if (data.status && data.status !== "success") {
+        const assistantText = String(data.aries_text || data.message || "...");
+        setChatHistory(prev => [
+          ...prev,
+          { role: "USER", content: data.user_text || "..." },
+          { role: "ARIES", content: assistantText },
+        ]);
+        if (data.audio) await playVoiceResponse(data.audio);
+        else setStatus("IDLE");
+        return;
+      }
+
       if (data.status === "success") {
-        const ariesText = data.aries_text || "...";
+        const ariesText = data.aries_text || data.message || "...";
         setChatHistory(prev => [
           ...prev,
           { role: "USER",  content: data.user_text || "..." },

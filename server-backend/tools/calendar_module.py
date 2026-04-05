@@ -4,6 +4,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from logger import log_debug, log_error
 
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
@@ -35,7 +36,7 @@ def get_calendar_service():
             try:
                 creds.refresh(Request())
             except Exception as e:
-                print(f"[AUTH] Token refresh failed ({e}), forcing re-auth.")
+                log_error(f"AUTH token refresh failed ({e}), forcing re-auth.")
                 creds = None  # fall through to full re-auth below
 
         if not creds or not creds.valid:
@@ -83,12 +84,12 @@ def get_upcoming_events(max_results=10, timeMin=None, timeMax=None):
                 source="google_calendar_detected",
             )
         except Exception as sync_exc:
-            print(f"[CALENDAR SYNC] detect->supabase sync failed: {sync_exc}")
+            log_error(f"CALENDAR sync detect->supabase failed: {sync_exc}")
 
         return items
 
     except Exception as e:
-        print(f"[ERROR FETCHING] {e}")
+        log_error(f"Calendar fetching error: {e}")
         return []
 
 
@@ -126,7 +127,7 @@ def get_primary_calendar_user_id():
             return first_calendar.get('id') or first_calendar.get('summary')
 
     except Exception as e:
-        print(f"[CALENDAR USER ID] {e}")
+        log_debug(f"[CALENDAR USER ID] {e}")
 
     return None
 
@@ -314,7 +315,7 @@ def find_multiple_free_slots(duration: datetime.timedelta, search_from: datetime
 
 
 def suggest_reschedule_slots(event, count: int = 5):
-    print(f"[DEBUG EVENT] summary={event.get('summary')} start={event['start']} end={event.get('end')}")
+    log_debug(f"[DEBUG EVENT] summary={event.get('summary')} start={event['start']} end={event.get('end')}")
     try:
         start_str = event['start'].get('dateTime') or event['start'].get('date')
         end_str   = event.get('end', {}).get('dateTime') or event.get('end', {}).get('date')
@@ -329,10 +330,10 @@ def suggest_reschedule_slots(event, count: int = 5):
             end_dt = datetime.datetime.fromisoformat(end_str.replace('Z', '+00:00')).astimezone(IST)
             duration = end_dt - start_dt
             if duration.total_seconds() <= 0:
-                print(f"[WARN] Event has zero/negative duration — defaulting to 1 hour")
+                log_debug("[WARN] Event has zero/negative duration — defaulting to 1 hour")
                 duration = datetime.timedelta(hours=1)
         else:
-            print(f"[WARN] Event has no end time — defaulting to 1 hour")
+            log_debug("[WARN] Event has no end time — defaulting to 1 hour")
             duration = datetime.timedelta(hours=1)
 
         search_from = datetime.datetime.now(IST) + datetime.timedelta(minutes=30)
@@ -367,7 +368,7 @@ def suggest_reschedule_slots(event, count: int = 5):
         return msg, result_slots
 
     except Exception as e:
-        print(f"[suggest_reschedule_slots ERROR] {e}")
+        log_error(f"suggest_reschedule_slots error: {e}")
         return "I ran into an issue finding free slots, Sir.", []
 
 
@@ -409,7 +410,7 @@ def confirm_reschedule(event, new_start: datetime.datetime, new_end: datetime.da
         )
 
     except Exception as e:
-        print(f"[confirm_reschedule ERROR] {e}")
+        log_error(f"confirm_reschedule error: {e}")
         return "The reschedule failed, Sir. Calendar uplink error."
 
 
@@ -452,11 +453,11 @@ def create_event(summary, start_iso, end_iso):
                 source="aris_created",
             )
         except Exception as sync_exc:
-            print(f"[CALENDAR SYNC] aris_created->supabase sync failed: {sync_exc}")
+            log_error(f"CALENDAR sync aris_created->supabase failed: {sync_exc}")
 
         return True
     except Exception as e:
-        print(f"[Create Error] {e}")
+        log_error(f"Calendar create error: {e}")
         return False
 
 
@@ -497,5 +498,5 @@ def reschedule_next_event(new_time_str):
         return f"Moved '{event.get('summary', 'the event')}' to {new_time_str}, Sir."
 
     except Exception as e:
-        print(f"[Manual Reschedule Error] {e}")
+        log_error(f"Manual reschedule error: {e}")
         return "Error updating event, Sir."

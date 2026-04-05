@@ -1,5 +1,6 @@
 import pyttsx3
-import os
+
+from logger import logger, log_error
 
 def text_to_speech(text, output_path):
     """
@@ -7,7 +8,7 @@ def text_to_speech(text, output_path):
     No internet required.
     """
     try:
-        print(f"[TTS] Synthesizing: {text[:30]}...")
+        logger.debug(f"[TTS] Synthesizing: {text[:30]}...")
         engine = pyttsx3.init()
 
         # --- JARVIS SETTINGS ---
@@ -22,8 +23,8 @@ def text_to_speech(text, output_path):
         engine.save_to_file(text, output_path)
         engine.runAndWait()
         
-        print(f"[TTS] Voice generated at {output_path}")
+        logger.debug(f"[TTS] Voice generated at {output_path}")
         return True
     except Exception as e:
-        print(f"[TTS ERROR] {e}")
+        log_error(f"TTS error: {e}")
         return False

@@ -20,4 +20,6 @@ def fetch_live_info(query):
 
 # Quick test (Run this file directly to verify)
 if __name__ == "__main__":
-    print(fetch_live_info("Current weather in Kochi"))
+    from logger import logger
+
+    logger.debug(fetch_live_info("Current weather in Kochi"))
