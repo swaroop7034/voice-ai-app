@@ -50,11 +50,17 @@ def is_safe_folder_command(text: str | None) -> bool:
         return False
 
     normalized = _normalize_phrase(text)
-    if normalized in {"private files", "private file", "privatefiles", "privatefile"}:
+    if normalized in {
+        "private files",
+        "private file",
+        "privatefiles",
+        "privatefile",
+    }:
         return True
 
     tokens = set(normalized.split())
-    return "private" in tokens and ("files" in tokens or "file" in tokens)
+    has_private_phrase = "private" in tokens and ("files" in tokens or "file" in tokens)
+    return has_private_phrase
 
 
 def is_voice_reset_command(text: str | None) -> bool:

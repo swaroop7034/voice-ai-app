@@ -1,7 +1,27 @@
-const DEFAULT_API_BASE_URL = 'http://10.39.74.10:8000';
+import Constants from 'expo-constants';
+
+const DEFAULT_API_BASE_URL = 'http://127.0.0.1:8000';
 const REQUEST_TIMEOUT_MS = Number(process.env.EXPO_PUBLIC_API_TIMEOUT_MS || 20000);
 
-export const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL || DEFAULT_API_BASE_URL;
+function resolveApiBaseUrl(): string {
+  const fromEnv = process.env.EXPO_PUBLIC_API_BASE_URL?.trim();
+  if (fromEnv) {
+    return fromEnv;
+  }
+
+  // In Expo Go/dev builds, derive the host machine IP used by Metro and target backend port 8000.
+  const hostUri = (Constants as any)?.expoConfig?.hostUri as string | undefined;
+  if (hostUri) {
+    const host = hostUri.split(':')[0]?.trim();
+    if (host) {
+      return `http://${host}:8000`;
+    }
+  }
+
+  return DEFAULT_API_BASE_URL;
+}
+
+export const API_BASE_URL = resolveApiBaseUrl();
 
 export type SafeFolderAccessResponse = {
   status?: string;

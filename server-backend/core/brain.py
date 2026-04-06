@@ -1,10 +1,10 @@
 import asyncio
 import re
+import time
 from datetime import datetime, timedelta, timezone
 import ollama
 from core.llm_manager import get_aries_response, get_recent_chat_history
 from core.memory_classifier import classify_and_store_background
-from core.behavior_analyzer import build_behavior_context
 from core.user_profile import get_user_profile, update_user_profile, format_profile_section
 from core.intelligence_layer import (
     MAX_HISTORY,
@@ -28,6 +28,7 @@ from tools.calendar_module import (
     confirm_reschedule,
 )
 import core.state as state
+from core.cache import get_cached_response, set_cached_response
 from integrations.supabase_store import build_memory_context, get_default_user_id, log_interaction, search_similar
 from logger import logger, log_error, log_step
 
@@ -136,6 +137,8 @@ RENAME_KEYWORDS = ["rename", "retitle", "change title", "change name", "call it"
 CANCEL_KEYWORDS = ["cancel", "drop", "remove", "delete", "call off"]
 QUERY_EVENT_KEYWORDS = ["agenda", "events", "meeting", "schedule", "plans"]
 QUERY_VERBS = ["what", "show", "list", "check", "tell"]
+FAST_GREETING_WORDS = {"hi", "hello", "hey", "good morning", "good afternoon", "good evening"}
+FAST_ACK_WORDS = {"ok", "okay", "yes", "yep", "thanks", "thank you", "sure"}
 
 
 def _is_reschedule_intent(text: str) -> bool:
@@ -187,7 +190,58 @@ def classify_intent(text: str) -> str:
     return "general"
 
 
+def fast_route(text: str) -> str | None:
+    normalized = text.lower().strip()
+    if not normalized:
+        return "I am standing by, Sir."
+
+    if normalized in FAST_ACK_WORDS:
+        if normalized in {"thanks", "thank you"}:
+            return "Always at your service, Sir."
+        return "Understood, Sir."
+
+    if normalized in FAST_GREETING_WORDS:
+        return "Good to hear from you, Sir."
+
+    if re.search(TIME_QUERY_REGEX, normalized):
+        return f"The current time is {datetime.now(IST).strftime('%I:%M %p')}."
+
+    if "how are you" in normalized:
+        return "All systems are nominal. Logic processors are primed."
+
+    return None
+
+
+def build_compact_prompt(
+    memory_context: str,
+    profile_context: str,
+    behavior_context: str,
+    conversation_context: str,
+    max_chars: int = 1800,
+) -> tuple[str, str, str, str]:
+    sections = [memory_context.strip(), profile_context.strip(), behavior_context.strip(), conversation_context.strip()]
+    trimmed_sections: list[str] = []
+    remaining = max_chars
+
+    for section in sections:
+        if remaining <= 0:
+            trimmed_sections.append("")
+            continue
+        if len(section) <= remaining:
+            trimmed_sections.append(section)
+            remaining -= len(section)
+        else:
+            trimmed_sections.append(section[:remaining])
+            remaining = 0
+
+    while len(trimmed_sections) < 4:
+        trimmed_sections.append("")
+
+    return tuple(trimmed_sections[:4])  # type: ignore[return-value]
+
+
 async def classify_intent_with_llm(text: str) -> str:
+    """Non-blocking async phi3 classification (for background use only)."""
     prompt = (
         "Classify this request into one of [schedule, reschedule, rename, cancel, general]. "
         "Return only one word.\n"
@@ -208,6 +262,15 @@ async def classify_intent_with_llm(text: str) -> str:
     except Exception as exc:
         log_error(f"INTENT LLM fallback failed: {exc}")
         return "general"
+
+
+def _classify_intent_background(text: str) -> None:
+    """Background thread to classify intent with phi3 (non-blocking, logs only)."""
+    try:
+        asyncio.run(classify_intent_with_llm(text))
+        logger.debug(f"[INTENT BACKGROUND] phi3 classification completed for: {text[:80]}")
+    except Exception as exc:
+        log_error(f"Background phi3 classification failed: {exc}")
 
 
 def _reset_state():
@@ -622,10 +685,14 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
 
     intent = classify_intent(text)
     intent_source = "rule"
+    
     if intent == "uncertain":
-        fallback_intent = await classify_intent_with_llm(text)
-        intent = "query_event" if fallback_intent == "general" and any(v in text for v in QUERY_VERBS) and any(k in text for k in QUERY_EVENT_KEYWORDS) else fallback_intent
-        intent_source = "llm"
+        # Default to "general" immediately (non-blocking fast path)
+        # Background task will refine this asynchronously (see main.py)
+        intent = "general"
+        intent_source = "fast_default"
+        log_step("INTENT_UNCERTAIN_DEFAULTING_TO_GENERAL")
+    
     if force_schedule_intent:
         intent = "schedule"
         intent_source = "context"
@@ -1041,19 +1108,25 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
     if state.last_intent != "CONFIRMING_ALERT":
         state.last_intent = None
 
+    routed_response = fast_route(text)
+    if routed_response is not None:
+        return routed_response
+
+    fallback_stage_start = time.perf_counter()
+
     memory_task = asyncio.create_task(search_similar(user_text, resolved_user_id, limit=8))
     history_task = asyncio.create_task(get_recent_chat_history(resolved_user_id, limit=MAX_HISTORY))
     profile_task = asyncio.create_task(get_user_profile(resolved_user_id))
-    behavior_task = asyncio.create_task(build_behavior_context(resolved_user_id, limit=3))
-    retrieved_memories, recent_history, profile, behavior_context = await asyncio.gather(
+    retrieved_memories, recent_history, profile = await asyncio.gather(
         memory_task,
         history_task,
         profile_task,
-        behavior_task,
     )
+    behavior_context = ""
 
-    log_step("USER_FETCH_COMPLETED")
-    log_step("VECTOR_SEARCH_COMPLETED")
+    user_fetch_elapsed_ms = int((time.perf_counter() - fallback_stage_start) * 1000)
+    log_step("USER_FETCH_COMPLETED", user_fetch_elapsed_ms)
+    log_step("VECTOR_SEARCH_COMPLETED", user_fetch_elapsed_ms)
 
     decayed_memories = apply_memory_decay(retrieved_memories)
     memory_candidates, preference_memories = filter_memories_by_type(decayed_memories)
@@ -1075,11 +1148,25 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
     if preference_context:
         profile_context = f"{profile_context}\n\n## Preference memories:\n{preference_context}".strip()
 
-    log_step("CONTEXT_BUILD_COMPLETED")
+    memory_context, profile_context, behavior_context, _ = build_compact_prompt(
+        memory_context,
+        profile_context,
+        behavior_context,
+        "\n".join(
+            [
+                f"* {message.get('role', 'user').capitalize()}: {(message.get('content') or '')[:160]}"
+                for message in recent_history[-MAX_HISTORY:]
+            ]
+        ),
+    )
+
+    context_build_elapsed_ms = int((time.perf_counter() - fallback_stage_start) * 1000)
+    log_step("CONTEXT_BUILD_COMPLETED", context_build_elapsed_ms)
 
     should_verify_web = await _should_verify_with_web(user_text)
     if should_verify_web:
-        log_step("WEB_VERIFY_TRIGGERED")
+        web_verify_elapsed_ms = int((time.perf_counter() - fallback_stage_start) * 1000)
+        log_step("WEB_VERIFY_TRIGGERED", web_verify_elapsed_ms)
         web_data = fetch_live_info(user_text)
         if not web_data or web_data.startswith("Search error:"):
             return "I can't verify this on the web right now, so I won't guess."
@@ -1101,6 +1188,12 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
             allow_search_protocol=False,
             grounded_mode=True,
         )
+
+    cache_key = f"{resolved_user_id}:{text}"
+    cached_response = get_cached_response(cache_key)
+    if cached_response is not None:
+        log_step("RESPONSE_CACHE_HIT")
+        return str(cached_response)
 
     response = await get_aries_response(
         user_text,
@@ -1134,6 +1227,7 @@ async def process_text(user_text: str, user_id: str | None = None) -> str:
         except Exception:
             return "I can't verify this on the web right now, so I won't guess."
 
+    set_cached_response(cache_key, response)
     return response
 
 

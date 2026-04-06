@@ -1,6 +1,24 @@
+import threading
+
 import pyttsx3
 
 from logger import logger, log_error
+
+_ENGINE_LOCK = threading.Lock()
+_ENGINE = None
+
+
+def _get_engine():
+    global _ENGINE
+    with _ENGINE_LOCK:
+        if _ENGINE is None:
+            _ENGINE = pyttsx3.init()
+            _ENGINE.setProperty('rate', 210)
+            voices = _ENGINE.getProperty('voices')
+            if voices:
+                _ENGINE.setProperty('voice', voices[0].id)
+        return _ENGINE
+
 
 def text_to_speech(text, output_path):
     """
@@ -9,20 +27,12 @@ def text_to_speech(text, output_path):
     """
     try:
         logger.debug(f"[TTS] Synthesizing: {text[:30]}...")
-        engine = pyttsx3.init()
-
-        # --- JARVIS SETTINGS ---
-        # 1. Speed: Default is 200. Increase to 220 for a snappier feel.
-        engine.setProperty('rate', 210) 
-
-        # 2. Voice: 0 is usually a male voice (David), 1 is female (Zira).
-        voices = engine.getProperty('voices')
-        engine.setProperty('voice', voices[0].id) 
+        engine = _get_engine()
 
         # Save to file for the phone to receive
         engine.save_to_file(text, output_path)
         engine.runAndWait()
-        
+
         logger.debug(f"[TTS] Voice generated at {output_path}")
         return True
     except Exception as e:
