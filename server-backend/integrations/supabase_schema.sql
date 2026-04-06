@@ -82,6 +82,18 @@ create table if not exists public.calendar_events (
   unique(user_id, google_event_id)
 );
 
+create table if not exists public.behavior_logs (
+  id bigint generated always as identity primary key,
+  user_id text not null,
+  source text,
+  raw_text text,
+  intent text,
+  category text,
+  confidence float,
+  behavior_json jsonb not null,
+  created_at timestamptz default now()
+);
+
 -- 4. Indexes (SAFE)
 create index if not exists inetartction_user_id_idx
   on public.inetartction (user_id);
@@ -120,6 +132,15 @@ create index if not exists calendar_events_source_idx
 
 create index if not exists calendar_events_raw_event_idx
   on public.calendar_events using gin (raw_event);
+
+create index if not exists behavior_logs_user_id_idx
+  on public.behavior_logs (user_id, created_at desc);
+
+create index if not exists behavior_logs_intent_idx
+  on public.behavior_logs (intent, confidence desc);
+
+create index if not exists behavior_logs_json_idx
+  on public.behavior_logs using gin (behavior_json);
 
 -- 5. Drop all old versions of function
 do $$

@@ -14,8 +14,9 @@ import {
 import { ProfileCard } from '@/components/settings/ProfileCard';
 import { SettingsSection } from '@/components/settings/SettingsSection';
 import { ToggleSwitch } from '@/components/settings/ToggleSwitch';
+import { API_BASE_URL } from '@/lib/safeFolderApi';
 
-const API_BASE = 'http://192.168.1.4:8000';
+const API_BASE = API_BASE_URL;
 
 type UserProfile = {
   name: string;

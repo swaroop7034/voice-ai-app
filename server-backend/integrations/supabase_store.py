@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any
 
@@ -20,8 +20,9 @@ load_dotenv()
 DEFAULT_TABLE_NAME = "inetartction"
 DEFAULT_EMBEDDING_MODEL = "nomic-embed-text"
 DEFAULT_SIMILARITY_THRESHOLD = 0.55
-DEFAULT_MEMORY_LIMIT = 5
+DEFAULT_MEMORY_LIMIT = 4
 DEFAULT_MEMORY_CHAR_LIMIT = 1200
+DEFAULT_RECENT_DAYS = 5
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -92,6 +93,7 @@ class SupabaseInteractionStore:
         self.similarity_threshold = _env_float("SUPABASE_SIMILARITY_THRESHOLD", DEFAULT_SIMILARITY_THRESHOLD)
         self.memory_limit = _env_int("SUPABASE_MEMORY_LIMIT", DEFAULT_MEMORY_LIMIT)
         self.memory_char_limit = _env_int("SUPABASE_MEMORY_CHAR_LIMIT", DEFAULT_MEMORY_CHAR_LIMIT)
+        self.recent_memory_days = _env_int("SUPABASE_MEMORY_RECENT_DAYS", DEFAULT_RECENT_DAYS)
         self.enabled = bool(self.url and self.key)
         self.client: Client | None = None
 
@@ -107,6 +109,24 @@ class SupabaseInteractionStore:
             if isinstance(value, (int, float)):
                 return float(value)
         return 0.0
+
+    def _parse_datetime(self, value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except Exception:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _is_recent(self, value: str | None) -> bool:
+        parsed = self._parse_datetime(value)
+        if parsed is None:
+            return True
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, self.recent_memory_days))
+        return parsed >= cutoff
 
     def _row_to_memory(self, row: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -236,7 +256,7 @@ class SupabaseInteractionStore:
         self,
         query: str,
         user_id: str | None,
-        limit: int = 5,
+        limit: int = 4,
         threshold: float = 0.75,
     ) -> list[dict[str, Any]]:
         if not self.enabled or self.client is None:
@@ -244,6 +264,7 @@ class SupabaseInteractionStore:
             return []
 
         resolved_user_id = user_id.strip() if user_id and user_id.strip() else _default_user_id()
+        limit = max(3, min(limit, 5))
         _supabase_log(f"[SUPABASE] Searching memory for user_id={resolved_user_id}")
         query_embedding = await self._embed_query(query)
         if not query_embedding:
@@ -264,6 +285,9 @@ class SupabaseInteractionStore:
 
         memories = [self._row_to_memory(row) for row in raw_rows]
         memories = [item for item in memories if item["similarity"] >= threshold]
+        recent_memories = [item for item in memories if self._is_recent(item.get("created_at"))]
+        if recent_memories:
+            memories = recent_memories
         memories.sort(key=lambda item: item.get("score", item["similarity"]), reverse=True)
 
         if not memories:

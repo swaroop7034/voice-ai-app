@@ -1,5 +1,9 @@
 import asyncio
 from datetime import datetime
+import os
+import threading
+import time
+from typing import AsyncIterator
 
 import ollama
 from integrations.supabase_store import get_recent_interactions
@@ -7,6 +11,7 @@ from logger import log_debug, log_error, log_step
 
 CHAT_HISTORY_LIMIT = 14
 MAX_HISTORY = 5
+LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "20"))
 
 # Per-user in-memory chat state. Each value is a list of role/content messages.
 chat_history: dict[str, list[dict[str, str]]] = {}
@@ -201,10 +206,13 @@ async def get_aries_response(
 
         log_step("PROMPT_SENT_TO_LLM")
 
-        response = await asyncio.to_thread(
-            ollama.chat,
-            model='llama3.2',
-            messages=messages_to_send,
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                ollama.chat,
+                model='llama3.2',
+                messages=messages_to_send,
+            ),
+            timeout=max(5, LLM_TIMEOUT_SECONDS),
         )
 
         ai_message = response['message']['content']
@@ -216,3 +224,64 @@ async def get_aries_response(
     except Exception as e:
         log_error(f"Local AI connection to Ollama failed: {e}")
         return "My memory banks are currently inaccessible, Sir. Please check the local engine."
+
+
+async def stream_llm_response(
+    user_text: str,
+    user_id: str | None = None,
+    *,
+    memory_context: str = "",
+    profile_context: str = "",
+    behavior_context: str = "",
+    recent_history: list[dict[str, str]] | None = None,
+) -> AsyncIterator[str]:
+    resolved_user_id = _resolve_user_key(user_id)
+    today_date = datetime.now().strftime("%B %d, %Y")
+
+    if recent_history is None:
+        recent_history = await get_recent_chat_history(resolved_user_id, CHAT_HISTORY_LIMIT)
+    else:
+        recent_history = [message.copy() for message in recent_history[-CHAT_HISTORY_LIMIT:]]
+
+    recent_history = recent_history[-MAX_HISTORY:]
+    await append_chat_message(resolved_user_id, 'user', user_text)
+
+    conversation_context = _conversation_section(recent_history, limit=MAX_HISTORY)
+    system_prompt = _build_system_prompt(
+        today_date,
+        memory_context,
+        profile_context,
+        conversation_context,
+        behavior_context,
+    )
+    messages_to_send = [system_prompt, {'role': 'user', 'content': user_text}]
+
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    started_at = time.perf_counter()
+
+    def _worker() -> None:
+        try:
+            for item in ollama.chat(model='llama3.2', messages=messages_to_send, stream=True):
+                chunk = str(item.get('message', {}).get('content', ''))
+                if chunk:
+                    loop.call_soon_threadsafe(queue.put_nowait, chunk)
+        except Exception as exc:
+            log_error(f"Local AI streaming failed: {exc}")
+            loop.call_soon_threadsafe(queue.put_nowait, "My memory banks are currently inaccessible, Sir. Please check the local engine.")
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+    full_text: list[str] = []
+    while True:
+        item = await queue.get()
+        if item is None:
+            break
+        full_text.append(item)
+        yield item
+
+    if full_text:
+        await append_chat_message(resolved_user_id, 'assistant', ''.join(full_text))
+    log_step("LLM_STREAM_COMPLETED", int((time.perf_counter() - started_at) * 1000))

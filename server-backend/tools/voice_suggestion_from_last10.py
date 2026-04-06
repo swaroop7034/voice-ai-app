@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from collections import Counter
 from datetime import datetime
@@ -18,18 +19,59 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from core.behavior_analyzer import (
-    _extract_topics_phi3,
-    _is_generic_topic,
-    _pattern_confidence,
-    _resolve_user_id,
-    _suggestion_from_pattern,
-)
 from core.tts_engine import text_to_speech
-from integrations.supabase_store import interaction_store
+from integrations.supabase_store import get_default_user_id, interaction_store
 
 DEFAULT_ROWS = 10
 DEFAULT_OUTPUT = "temp_audio/outgoing/last10_suggestion.mp3"
+GENERIC_TOPICS = {"", "general", "other", "misc", "unknown", "none"}
+
+
+def _resolve_user_id(user_id: str | None) -> str:
+    resolved = (user_id or "").strip()
+    return resolved if resolved else get_default_user_id()
+
+
+def _is_generic_topic(topic: str | None) -> bool:
+    value = str(topic or "").strip().lower()
+    return value in GENERIC_TOPICS
+
+
+def _pattern_confidence(count: int, total: int) -> float:
+    ratio = count / max(total, 1)
+    return round(min(0.96, 0.30 + (ratio * 0.70)), 3)
+
+
+def _guess_topic_from_text(text: str) -> str:
+    tokens = [token for token in re.findall(r"[a-zA-Z0-9]+", text.lower()) if len(token) >= 4]
+    if not tokens:
+        return "unknown"
+
+    stop_words = {
+        "please", "could", "would", "should", "about", "today", "tomorrow", "there", "their",
+        "what", "when", "where", "which", "with", "from", "have", "make", "need", "want",
+        "meeting", "schedule", "remind", "assistant",
+    }
+    filtered = [token for token in tokens if token not in stop_words]
+    if not filtered:
+        return "unknown"
+
+    return Counter(filtered).most_common(1)[0][0]
+
+
+def _suggestion_from_pattern(pattern: dict[str, Any]) -> str | None:
+    ptype = str(pattern.get("pattern_type") or "").lower()
+    pdata = pattern.get("pattern_data") or {}
+
+    if ptype == "topic":
+        topic = str(pdata.get("topic") or "this area")
+        return f"You have focused repeatedly on {topic}; want a concise next-step plan, Sir?"
+
+    if ptype == "time":
+        hour = pdata.get("hour")
+        return f"You are most active around {hour}:00; should I schedule deep-work reminders at this time, Sir?"
+
+    return None
 
 
 def _play_audio_file(path: str) -> bool:
@@ -93,7 +135,7 @@ async def _build_patterns_from_rows(user_id: str, rows: list[dict[str, Any]]) ->
             topic_fix_indexes.append(idx)
             topic_fix_texts.append(user_text)
 
-    inferred_topics = await _extract_topics_phi3(topic_fix_texts) if topic_fix_texts else []
+    inferred_topics = [_guess_topic_from_text(text) for text in topic_fix_texts] if topic_fix_texts else []
     inferred_by_index: dict[int, str] = {}
     for i, row_index in enumerate(topic_fix_indexes):
         inferred = str(inferred_topics[i] if i < len(inferred_topics) else "unknown").strip().lower()

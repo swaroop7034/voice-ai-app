@@ -1,6 +1,7 @@
 import { Ionicons } from "@expo/vector-icons";
 import { Audio } from "expo-av";
 import { BlurView } from "expo-blur";
+import * as FileSystem from "expo-file-system/legacy";
 import * as Haptics from "expo-haptics";
 import { LinearGradient } from "expo-linear-gradient";
 import React, { useEffect, useState, useRef, useCallback } from "react";
@@ -177,8 +178,16 @@ export default function HomeScreen() {
         allowsRecordingIOS: false,
         playsInSilentModeIOS: true,
       });
+
+      const audioFileUri = `${FileSystem.cacheDirectory}aries-response-${Date.now()}.mp3`;
+      await FileSystem.writeAsStringAsync(
+        audioFileUri,
+        base64Audio.replace(/\s/g, ""),
+        { encoding: FileSystem.EncodingType.Base64 }
+      );
+
       const { sound } = await Audio.Sound.createAsync(
-        { uri: `data:audio/mp3;base64,${base64Audio.replace(/\s/g, "")}` },
+        { uri: audioFileUri },
         { shouldPlay: true, volume: 1.0 }
       );
       soundRef.current = sound;
@@ -188,6 +197,7 @@ export default function HomeScreen() {
           sound.unloadAsync();
           soundRef.current = null;
           setStatus("IDLE");
+          FileSystem.deleteAsync(audioFileUri, { idempotent: true }).catch(() => undefined);
         }
       });
     } catch (e) {

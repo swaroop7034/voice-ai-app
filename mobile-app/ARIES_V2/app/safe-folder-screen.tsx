@@ -6,6 +6,7 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  type DimensionValue,
   Linking,
   Platform,
   ScrollView,
@@ -101,7 +102,7 @@ export default function SafeFolderScreen() {
 
   const usedGB = usedBytes / (1024 * 1024 * 1024);
   const totalGB = totalBytes / (1024 * 1024 * 1024);
-  const storageFill = `${Math.max(0, Math.min((usedBytes / Math.max(totalBytes, 1)) * 100, 100))}%`;
+  const storageFill: DimensionValue = `${Math.max(0, Math.min((usedBytes / Math.max(totalBytes, 1)) * 100, 100))}%`;
 
   const handleUploadPress = async () => {
     try {
